@@ -155,6 +155,15 @@ python scripts/check_inference.py --all
 
 This validates model-file access, sizes and worker compatibility. It does not allocate a GPU or verify output quality.
 
+If the API reports `expected v1.3.0, received v1.4.2`, its existing `.env` still pins the older release. The current application and worker use `v1.4.2`. Update `TRIVEN_LTX_REPO_REF="v1.4.2"` in the server's `.env`, then recreate the containers to load the changed environment. A plain container restart does not reload Compose environment values:
+
+```bash
+docker compose -f docker-compose.production.yml up -d --force-recreate api maintenance
+docker compose -f docker-compose.production.yml exec -T api python /app/scripts/check_inference.py --all
+```
+
+Only retry generation when all enabled recipes pass. A disabled Modal workspace is a separate account/usage-limit issue; changing the LTX revision cannot resolve it.
+
 ## 8. Duration profiles
 
 Defaults:

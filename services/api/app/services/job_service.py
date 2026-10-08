@@ -435,6 +435,10 @@ def safe_job_error(exc: Exception, stage: str = "rendering") -> str:
         message = ("The deployed Modal worker is missing its readiness-check function. "
                    "Deploy the updated worker with `modal deploy modal/app.py`, then run "
                    "`python scripts/check_inference.py --all` before retrying.")
+    elif revision := re.search(r"Modal worker LTX revision mismatch: expected (v\d+\.\d+\.\d+), received (v\d+\.\d+\.\d+)\.", detail):
+        message = (f"LTX revision mismatch: the API expects {revision[1]}, but the deployed Modal worker uses {revision[2]}. "
+                   "Align TRIVEN_LTX_REPO_REF in the server .env with the deployed worker, recreate the API container, "
+                   "then run `python scripts/check_inference.py --all` before retrying.")
     elif "worker protocol" in lower or "worker ltx revision mismatch" in lower:
         message = ("The deployed Modal worker does not match this application. "
                    "Deploy `modal/app.py` with the same TRIVEN_LTX_REPO_REF as the API, "

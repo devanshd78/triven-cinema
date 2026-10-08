@@ -54,7 +54,8 @@ class ModalLTXProvider(VideoProvider):
             raise RuntimeError("Modal worker protocol is incompatible. Deploy the current worker with `modal deploy modal/app.py` before generating.")
         if manifest.get("ltx_repo_ref") != self.ltx_repo_ref:
             raise RuntimeError(f"Modal worker LTX revision mismatch: expected {self.ltx_repo_ref}, "
-                               f"received {manifest.get('ltx_repo_ref') or 'unknown'}. Deploy the worker with matching TRIVEN_LTX_REPO_REF.")
+                               f"received {manifest.get('ltx_repo_ref') or 'unknown'}. Align TRIVEN_LTX_REPO_REF "
+                               "in the API environment and worker deployment; recreate the API container after changing its .env.")
         if not manifest.get("ready"):
             raise RuntimeError("Modal inference is not ready: " + "; ".join(str(item) for item in manifest.get("errors", ["Unknown preflight error"])))
         self._preflight_cache[key] = (time.monotonic(), manifest)

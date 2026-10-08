@@ -32,6 +32,16 @@ class InferenceErrorMessageTests(unittest.TestCase):
                 self.assertIn('does not match this application', message)
                 self.assertIn('TRIVEN_LTX_REPO_REF', message)
 
+    def test_revision_mismatch_shows_both_versions_and_api_configuration_fix(self):
+        message = safe_job_error(RuntimeError(
+            'Modal worker LTX revision mismatch: expected v1.3.0, received v1.4.2. token=private-value'
+        ))
+        self.assertIn('API expects v1.3.0', message)
+        self.assertIn('worker uses v1.4.2', message)
+        self.assertIn('server .env', message)
+        self.assertIn('recreate the API container', message)
+        self.assertNotIn('private-value', message)
+
     def test_weight_failure_does_not_claim_the_readiness_function_is_missing(self):
         message = safe_job_error(RuntimeError('Modal inference is not ready: Missing or empty model files: test.safetensors'))
         self.assertIn('model weights', message)
