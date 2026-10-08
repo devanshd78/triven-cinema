@@ -4,12 +4,14 @@ from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
 
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from starlette.requests import Request
 
 from app.core.config import settings
 from app.services import auth_service as auth
 from app.services.identity_service import sign_workspace_id, workspace_id_from_request
-from app.api.routes.auth import request_login_otp
+from app.api.routes.auth import request_login_otp, router as auth_router
 from app.schemas.auth import RequestOtpRequest
 
 
@@ -28,11 +30,59 @@ class ProductionAuthTests(unittest.TestCase):
         ]:
             self.stack.enter_context(patch.object(obj, name, value))
 
-    def test_production_cannot_return_demo_code(self):
+    def test_production_demo_login_without_smtp_preserves_signed_account_session(self):
+        app = FastAPI()
+        app.include_router(auth_router, prefix='/auth')
+        with patch.object(settings, 'demo_auth_show_otp', True), \
+             patch.object(settings, 'smtp_host', ''), \
+             patch.object(settings, 'smtp_from_email', ''), \
+             patch.object(settings, 'smtp_use_tls', False), \
+             patch.object(auth.smtplib, 'SMTP') as smtp, \
+             patch.object(auth.smtplib, 'SMTP_SSL') as smtp_ssl, \
+             TestClient(app, base_url='https://cinema.example.test') as client:
+            auth.validate_auth_configuration()
+            self.assertTrue(auth.demo_login_enabled())
+            response = client.post('/auth/otp/request', json={'email': 'creator@example.test'})
+            self.assertEqual(response.status_code, 200, response.text)
+            challenge = response.json()
+            self.assertTrue(challenge['demo_mode'])
+            otp = challenge['demo_otp']
+            self.assertEqual(len(otp), 6)
+            self.assertTrue(otp.isdigit())
+            wrong = '000000' if otp != '000000' else '999999'
+            self.assertEqual(client.post('/auth/otp/verify', json={'email': 'creator@example.test', 'otp': wrong}).status_code, 400)
+            response = client.post('/auth/otp/verify', json={'email': 'creator@example.test', 'otp': otp})
+            self.assertEqual(response.status_code, 200, response.text)
+            user = response.json()['user']
+            cookies = response.headers.get_list('set-cookie')
+            self.assertTrue(cookies)
+            self.assertTrue(all('Secure' in cookie and 'HttpOnly' in cookie for cookie in cookies))
+            self.assertEqual(client.get('/auth/me').json()['user']['id'], user['id'])
+            self.assertEqual(client.post('/auth/otp/verify', json={'email': 'creator@example.test', 'otp': otp}).status_code, 400)
+            client.post('/auth/logout')
+            self.assertFalse(client.get('/auth/me').json()['authenticated'])
+            next_otp = client.post('/auth/otp/request', json={'email': 'creator@example.test'}).json()['demo_otp']
+            returning = client.post('/auth/otp/verify', json={'email': 'creator@example.test', 'otp': next_otp}).json()['user']
+            self.assertEqual(returning, user)
+            smtp.assert_not_called()
+            smtp_ssl.assert_not_called()
+
+    def test_production_demo_still_requires_auth_and_signing_key(self):
         with patch.object(settings, 'demo_auth_show_otp', True):
-            self.assertFalse(auth.demo_login_enabled())
-            with self.assertRaises(auth.AuthError):
-                auth.request_otp('creator@example.test')
+            with patch.object(settings, 'triven_secret_key', 'short'):
+                with self.assertRaisesRegex(auth.AuthError, 'TRIVEN_SECRET_KEY'):
+                    auth.validate_auth_configuration()
+            with patch.object(settings, 'auth_enabled', False):
+                with self.assertRaisesRegex(auth.AuthError, 'AUTH_ENABLED'):
+                    auth.validate_auth_configuration()
+
+    def test_smtp_configuration_is_required_only_when_demo_is_disabled(self):
+        with patch.object(settings, 'smtp_host', ''):
+            with self.assertRaises(auth.AuthDeliveryError):
+                auth.validate_auth_configuration()
+        with patch.object(settings, 'smtp_use_tls', False):
+            with self.assertRaises(auth.AuthDeliveryError):
+                auth.validate_auth_configuration()
 
     def test_production_delivers_email_without_returning_code(self):
         request = Request({'type': 'http', 'headers': [], 'client': ('127.0.0.1', 1234)})

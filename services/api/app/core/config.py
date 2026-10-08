@@ -103,7 +103,8 @@ class Settings(BaseSettings):
     continuity_qc_timeout_seconds: float = 12.0
     continuity_qc_max_frames: int = 5
 
-    # Demo codes are available only in development. Production requires SMTP.
+    # Demo OTP can be displayed in any environment, including the hosted demo.
+    # Set false to send codes by SMTP instead of returning them to the browser.
     auth_enabled: bool = True
     demo_auth_show_otp: bool = True
     auth_otp_ttl_seconds: int = 600

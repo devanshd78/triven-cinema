@@ -1,7 +1,11 @@
 import unittest
+import io
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
+from scripts import production_preflight
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,6 +40,7 @@ class HostingerDeploymentTests(unittest.TestCase):
         self.assertIn("ENABLE_SYNC_RENDER_ENDPOINTS=false", text)
         self.assertIn("JOB_WORKERS=1", text)
         self.assertIn("JOB_MAX_PENDING=3", text)
+        self.assertIn("DEMO_AUTH_SHOW_OTP=true", text)
         self.assertIn("MAX_1080P_SCENE_SECONDS=30", text)
         self.assertIn("MAX_4K_SCENE_SECONDS=15", text)
 
@@ -45,6 +50,31 @@ class HostingerDeploymentTests(unittest.TestCase):
         self.assertIn('TRIVEN_DOMAIN="devansh.info"', env_text)
         self.assertIn('FRONTEND_URL="https://devansh.info"', env_text)
         self.assertIn("server_name devansh.info;", nginx_text)
+
+
+class ProductionLoginPreflightTests(unittest.TestCase):
+    def check_configuration(self, **overrides):
+        env = {'AUTH_ENABLED': 'true', 'TRIVEN_SECRET_KEY': 'test-secret-with-at-least-32-characters'}
+        env.update(overrides)
+        with patch.object(production_preflight, 'ERRORS', []), redirect_stdout(io.StringIO()):
+            production_preflight.check_auth_configuration(env)
+            return list(production_preflight.ERRORS)
+
+    def test_demo_production_needs_no_smtp(self):
+        for flag in ('true', '1', 'yes'):
+            with self.subTest(flag=flag):
+                self.assertEqual(self.check_configuration(DEMO_AUTH_SHOW_OTP=flag, SMTP_USE_TLS='false'), [])
+        self.assertEqual(self.check_configuration(), [])
+
+    def test_email_login_still_checks_delivery_configuration(self):
+        errors = self.check_configuration(DEMO_AUTH_SHOW_OTP='false', SMTP_USE_TLS='false')
+        self.assertEqual(len(errors), 3)
+        self.assertTrue(any('SMTP_HOST' in error for error in errors))
+        self.assertEqual(self.check_configuration(DEMO_AUTH_SHOW_OTP='false', SMTP_HOST='smtp.example.test', SMTP_FROM_EMAIL='login@example.test'), [])
+
+    def test_demo_login_keeps_auth_and_signing_key_checks(self):
+        self.assertTrue(self.check_configuration(DEMO_AUTH_SHOW_OTP='true', TRIVEN_SECRET_KEY='short'))
+        self.assertTrue(self.check_configuration(DEMO_AUTH_SHOW_OTP='true', AUTH_ENABLED='false'))
 
 
 if __name__ == "__main__":

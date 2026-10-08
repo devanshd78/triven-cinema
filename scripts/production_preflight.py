@@ -71,6 +71,24 @@ def hostname_resolves(hostname: str) -> bool:
         return False
 
 
+def check_auth_configuration(env: dict[str, str]) -> None:
+    if env.get("AUTH_ENABLED", "true").lower() not in {"true", "1", "yes"}:
+        fail("AUTH_ENABLED must be true in production")
+        return
+    if len(env.get("TRIVEN_SECRET_KEY", "").strip()) >= 32:
+        ok("TRIVEN_SECRET_KEY configured for signed login sessions")
+    else:
+        fail("TRIVEN_SECRET_KEY must contain at least 32 characters for production login")
+    if env.get("DEMO_AUTH_SHOW_OTP", "true").lower() in {"true", "1", "yes"}:
+        ok("Demo OTP login enabled: codes are displayed in the browser; SMTP is not required")
+        return
+    for key in ("SMTP_HOST", "SMTP_FROM_EMAIL"):
+        if not env.get(key, "").strip():
+            fail(f"{key} is required when DEMO_AUTH_SHOW_OTP=false")
+    if env.get("SMTP_USE_TLS", "true").lower() not in {"true", "1", "yes"} and env.get("SMTP_USE_SSL", "false").lower() not in {"true", "1", "yes"}:
+        fail("SMTP must use TLS or SSL in production")
+
+
 def main() -> int:
     print("Triven Cinema Hostinger VPS production preflight")
     print(f"Project: {ROOT}")
@@ -140,20 +158,7 @@ def main() -> int:
     else:
         warn("CORS_ORIGINS is set; same-origin Hostinger deployment normally does not need CORS")
 
-    if env.get("AUTH_ENABLED", "true").lower() in {"true", "1", "yes"}:
-        if len(env.get("TRIVEN_SECRET_KEY", "")) >= 32:
-            ok("TRIVEN_SECRET_KEY configured for signed login sessions")
-        else:
-            fail("TRIVEN_SECRET_KEY must contain at least 32 characters for production login")
-        if env.get("DEMO_AUTH_SHOW_OTP", "true").lower() in {"true", "1", "yes"}:
-            fail("DEMO_AUTH_SHOW_OTP must be false in production; configure SMTP email delivery")
-        for key in ("SMTP_HOST", "SMTP_FROM_EMAIL"):
-            if not env.get(key):
-                fail(f"{key} is required for production login")
-        if env.get("SMTP_USE_TLS", "true").lower() not in {"true", "1", "yes"} and env.get("SMTP_USE_SSL", "false").lower() not in {"true", "1", "yes"}:
-            fail("SMTP must use TLS or SSL in production")
-    else:
-        fail("AUTH_ENABLED must be true in production")
+    check_auth_configuration(env)
 
     if env.get("VIDEO_PROVIDER") == "modal":
         ok("VIDEO_PROVIDER=modal")

@@ -16,7 +16,7 @@ Triven Cinema is an AI video factory: prompt input, continuity-locked storyboard
 - LTX-2.5 native temporal-window rendering for long Modal scenes with carry/blend overlap.
 - Prompt-to-finished-video Factory mode with strict scene continuity and up to 300s total runtime by default.
 - Persistent asynchronous video jobs in `storage/jobs/jobs.sqlite3`.
-- Email OTP login with signed HttpOnly account sessions. Browser-visible demo codes are limited to local development; production requires SMTP.
+- OTP login with signed HttpOnly account sessions. `DEMO_AUTH_SHOW_OTP=true` displays the code in the browser in development and production; SMTP is only needed when this flag is false.
 - Account-owned Previous Chats in `storage/chats/chats.sqlite3`, with safe one-time migration from the old browser-only history.
 - UI polling with coarse real job stages: queued -> initializing -> rendering -> delivery -> probing -> complete.
 - Per-scene source previews and regeneration.
@@ -301,7 +301,9 @@ deploy/hostinger/README.md
 
 ### Reliability update deployment
 
-The reliability update requires the new Modal worker (CPU preflight protocol 2) and production SMTP configuration. Run `modal deploy modal/app.py` separately before application rollout. `scripts/check_inference.py --all` checks enabled model recipes and authenticated weight access without allocating a GPU. The application deployment now stops on a failed backup, inference preflight, or public HTTPS health check.
+The reliability update requires the new Modal worker (CPU preflight protocol 2). Hosted demo login uses `AUTH_ENABLED=true` and `DEMO_AUTH_SHOW_OTP=true`; no SMTP configuration is needed. Existing servers must update this flag in their `.env`, since changing the example file does not change a deployed environment. Keep the existing `TRIVEN_SECRET_KEY` (at least 32 characters) to preserve sessions and integrations. Demo mode displays the code to the person entering the email address; it does not verify mailbox ownership. Set the flag to false and configure SMTP if email verification is desired.
+
+Run `modal deploy modal/app.py` separately before application rollout. `scripts/check_inference.py --all` checks enabled model recipes and authenticated weight access without allocating a GPU. The application deployment now stops on a failed backup, inference preflight, or public HTTPS health check.
 
 Runtime databases and Character uploads are no longer tracked in Git. **Before the first VPS pull of this update, follow the one-time storage migration in `deploy/hostinger/README.md`.** A pull that removes formerly tracked files can otherwise remove the server's copies. Existing database schemas and media ownership records migrate automatically at API startup; later job pruning does not revoke asset ownership.
 

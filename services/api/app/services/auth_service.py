@@ -41,7 +41,7 @@ class AuthDeliveryError(AuthError):
 
 
 def demo_login_enabled() -> bool:
-    return settings.demo_auth_show_otp and not settings.is_production
+    return settings.demo_auth_show_otp
 
 
 def validate_auth_configuration() -> None:
@@ -49,10 +49,10 @@ def validate_auth_configuration() -> None:
         return
     if not settings.auth_enabled:
         raise AuthError("Production requires AUTH_ENABLED=true.")
-    if settings.demo_auth_show_otp:
-        raise AuthError("Production requires DEMO_AUTH_SHOW_OTP=false and SMTP email delivery.")
     if len(settings.triven_secret_key.strip()) < 32:
         raise AuthError("Production requires a TRIVEN_SECRET_KEY of at least 32 characters.")
+    if demo_login_enabled():
+        return
     if not settings.smtp_host.strip() or not settings.smtp_from_email.strip():
         raise AuthDeliveryError("Configure SMTP_HOST and SMTP_FROM_EMAIL for production login.")
     if not (settings.smtp_use_tls or settings.smtp_use_ssl):

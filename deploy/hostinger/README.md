@@ -94,15 +94,8 @@ DEBUG=false
 FRONTEND_URL="https://devansh.info"
 CORS_ORIGINS=""
 AUTH_ENABLED=true
-DEMO_AUTH_SHOW_OTP=false
+DEMO_AUTH_SHOW_OTP=true
 TRIVEN_SECRET_KEY="use-a-random-secret-of-at-least-32-characters"
-SMTP_HOST="your-email-provider-host"
-SMTP_PORT=587
-SMTP_USERNAME="your-email-user"
-SMTP_PASSWORD="your-email-password"
-SMTP_FROM_EMAIL="your-verified-sender@example.com"
-SMTP_USE_TLS=true
-SMTP_USE_SSL=false
 VIDEO_PROVIDER="modal"
 GEMINI_API_KEY="..."
 MODAL_TOKEN_ID="..."
@@ -121,7 +114,7 @@ python3 scripts/production_preflight.py
 
 Fix every `[FAIL]` before deploying. The script expects host Nginx to own public 80/443.
 
-Production refuses demo OTP display, missing email configuration and short session-signing keys. SMTP delivery should be verified with your own account before launch. Preserve the existing signing key when it is already strong; changing it invalidates sessions and affects encrypted integrations.
+Demo OTP is supported in production: `DEMO_AUTH_SHOW_OTP=true` displays the code on the login screen and skips SMTP. This mode does not verify mailbox ownership. To use email verification instead, set `DEMO_AUTH_SHOW_OTP=false` and configure `SMTP_HOST`, `SMTP_FROM_EMAIL`, credentials, and TLS/SSL as listed in `.env.production.example`. Production requires a session-signing key of at least 32 characters in either mode. Preserve the existing signing key when it is already strong; changing it invalidates sessions and affects encrypted integrations.
 
 ## 6. Deploy application containers
 
@@ -213,7 +206,7 @@ tar -xzf "$TRIVEN_STATE_BACKUP" -C .
 
 Do not apply the runtime-state stash after the pull: restoring from the archive keeps those files untracked. If the pull fails, restore the archive before restarting the old application. Generated videos stay in the unchanged `storage/generated` bind mount. This sequence does not remove generated media.
 
-Configure the SMTP values above, refresh the Nginx template (it replaces untrusted forwarded IP headers for login rate limiting), deploy Modal separately, then rebuild the application:
+For demo login, set `AUTH_ENABLED=true` and `DEMO_AUTH_SHOW_OTP=true` in the server's existing `.env`; do not replace that file or its signing key. SMTP is not required in demo mode. Refresh the Nginx template (it replaces untrusted forwarded IP headers for login rate limiting), deploy Modal separately when its code changes, then rebuild the application:
 
 ```bash
 cd ~/triven-cinema
