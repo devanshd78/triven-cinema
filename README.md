@@ -329,7 +329,7 @@ Put spoken words in **Spoken dialogue**, including Hindi, and ambience/voice dir
 
 The Modal worker preserves the original take before successful texture refinement. When the refined video fails visual QC, the API checks that original before requesting another GPU render. It selects the original only on a passing QC verdict; failed and unavailable checks cannot approve it. Both takes remain available as generated assets, and cost accounting includes all work already performed. This requires the updated worker and API together; old workers remain compatible but cannot return the original take.
 
-For a small initial presenter test, use **Single scene**, one 10-second shot, 16:9, 1080p, Standard, Identity / Element reference, and Follow scene prompt. Factory mode has a 15-second minimum. Keep one clear face photo labeled `face`; avoid group photos as the active portrait. Use an explicit outfit description instead of asking the renderer to infer a costume filename. For example:
+For a small initial presenter test, use **Direct** mode, one 10-second shot, 16:9, 1080p, Standard, Native LTX audio, Identity / Element reference, and Follow scene prompt, with prompt enhancement off. Factory mode has a 15-second minimum. Keep one clear face photo labeled `face`; avoid group photos as the active portrait. Use an explicit outfit description instead of asking the renderer to infer a costume filename. For example:
 
 **Visual prompt**
 

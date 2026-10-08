@@ -31,6 +31,8 @@ class ModalPreservationTests(unittest.TestCase):
                 if failure == "mux":
                     raise RuntimeError("simulated remux failure")
                 kwargs["output_path"].write_bytes(b"refined-with-original-audio")
+                if failure == "missing_base":
+                    kwargs["source_video_path"].unlink()
             ns = {"Path": lambda value: root if value == "/tmp" else Path(value), "time": time, "uuid": uuid,
                   "shutil": shutil, "required_model_paths": lambda **kwargs: [], "MODEL_ROOT": root,
                   "build_command": command, "build_refine_details_command": command, "run_ltx_command": run,
@@ -57,6 +59,12 @@ class ModalPreservationTests(unittest.TestCase):
         self.assertIn('base_generation', result['timings_seconds'])
         self.assertIn('detail_refinement', result['timings_seconds'])
         self.assertTrue(all(value >= 0 for value in result['timings_seconds'].values()))
+
+    def test_unavailable_base_alternative_does_not_lose_refined_video(self):
+        result = self.run_worker("missing_base")
+        self.assertEqual(result["video_bytes"], b"refined-with-original-audio")
+        self.assertIsNone(result["base_video_bytes"])
+        self.assertTrue(result["detail_refined"])
 
 
 if __name__ == "__main__":
