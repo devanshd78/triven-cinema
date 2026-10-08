@@ -221,6 +221,7 @@ def _generate_video_impl(
     continuity_regenerations = 0
     continuity_warnings: list[str] = []
     qc_attempted = False
+    qc_unavailable = False
     final_qc_passed = True
     last_qc_note = ""
     result = None
@@ -286,7 +287,9 @@ def _generate_video_impl(
         total_chunks += int(result.chunk_count or 1)
 
         qc = None
-        if request.continuity_mode != "off" and request.continuity_qc_mode != "off":
+        # Direct generation must be inspectable too, even when continuity
+        # prompting / previous-frame chaining is off. QC is post-render only.
+        if request.continuity_qc_mode != "off":
             if progress:
                 progress("rendering", 78, "Checking entity count and duplicate-subject continuity...")
             qc = evaluate_scene_cardinality(
@@ -300,7 +303,8 @@ def _generate_video_impl(
                 canonical_reference_paths=element_canonical_reference_paths(active_elements),
             )
             qc_attempted = qc_attempted or not qc.skipped
-            if qc.skipped and request.continuity_qc_mode == "strict":
+            qc_unavailable = qc_unavailable or qc.skipped
+            if qc.skipped and request.continuity_qc_mode == "strict" and not settings.factory_qc_fail_open_on_unavailable:
                 candidate_path.unlink(missing_ok=True)
                 raise RuntimeError(f"Strict continuity QC could not run: {qc.note}")
             if qc.skipped and qc.note:
@@ -318,10 +322,10 @@ def _generate_video_impl(
 
         final_qc_passed = False
         message = f"Continuity QC failed after {attempt + 1} attempt(s): {last_qc_note}"
-        if request.continuity_qc_mode == "strict":
+        if request.continuity_qc_mode == "strict" and not settings.factory_preserve_on_qc_failure:
             candidate_path.unlink(missing_ok=True)
             raise RuntimeError(message)
-        continuity_warnings.append(message)
+        continuity_warnings.append(message + " Video retained for review; visual QC did not pass.")
         source_path = candidate_path
         break
 
@@ -359,6 +363,11 @@ def _generate_video_impl(
     )
 
     filename = delivery_path.name
+    visual_qc_status = (
+        "failed" if qc_attempted and not final_qc_passed else
+        "unavailable" if qc_unavailable else
+        "passed" if qc_attempted else "not_checked"
+    )
     record_generation_metric(
         {
             "type": "scene",
@@ -391,6 +400,7 @@ def _generate_video_impl(
             "entity_lock_count": len(enhanced_entity_locks),
             "continuity_qc_mode": request.continuity_qc_mode,
             "continuity_qc_passed": (final_qc_passed if qc_attempted else None),
+            "visual_qc_status": visual_qc_status,
             "continuity_regenerations": continuity_regenerations,
             "estimated_cost_usd": estimated_cost,
             "estimated_cost_per_output_minute_usd": estimated_cost_per_minute,
@@ -433,6 +443,7 @@ def _generate_video_impl(
         continuity_frame_url=media_url(continuity_frame_path.name) if continuity_frame_path else None,
         continuity_frame_filename=continuity_frame_path.name if continuity_frame_path else None,
         continuity_qc_passed=(final_qc_passed if qc_attempted else None),
+        visual_qc_status=visual_qc_status,
         continuity_regenerations=continuity_regenerations,
         continuity_warnings=continuity_warnings,
         elements_used=[f"@{item.handle}" for item in active_elements],

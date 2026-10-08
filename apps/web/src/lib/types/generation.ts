@@ -6,6 +6,7 @@ export type VideoModelName = "ltx-2.5" | "wan" | "minimax";
 export type DecoderName = "conv" | "diffusion";
 export type ContinuityMode = "off" | "balanced" | "strict";
 export type ContinuityQCMode = "off" | "auto" | "strict";
+export type QualityCheckStatus = "passed" | "failed" | "unavailable" | "not_checked";
 export type RealismProfile = "standard" | "real_skin" | "identity_max";
 export type GenerationMode = "factory" | "storyboard" | "direct";
 export type YouTubePrivacy = "private" | "unlisted" | "public";
@@ -180,6 +181,7 @@ export interface VideoGenerationResponse {
   continuity_frame_url: string | null;
   continuity_frame_filename: string | null;
   continuity_qc_passed: boolean | null;
+  visual_qc_status?: QualityCheckStatus;
   continuity_regenerations: number;
   continuity_warnings: string[];
   elements_used: string[];
@@ -360,6 +362,7 @@ export interface RenderedSceneVideo {
   continuityFrameUrl: string | null;
   continuityFrameFilename: string | null;
   continuityQcPassed: boolean | null;
+  visualQcStatus?: QualityCheckStatus;
   continuityRegenerations: number;
   continuityWarnings: string[];
   elementsUsed?: string[];
@@ -425,9 +428,11 @@ export interface FactoryGenerationResponse {
   continuity_id: string;
   entity_locks: EntityLock[];
   continuity_qc_passed: boolean | null;
+  visual_qc_status?: QualityCheckStatus;
   continuity_regenerations: number;
   continuity_warnings: string[];
   audio_qc_passed: boolean | null;
+  audio_qc_status?: QualityCheckStatus;
   audio_retake_count: number;
   audio_warnings: string[];
   elements_used: string[];

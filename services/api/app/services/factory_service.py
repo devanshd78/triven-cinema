@@ -252,8 +252,10 @@ def run_factory_generation(
     continuity_regenerations = 0
     qc_attempted = False
     all_qc_passed = True
+    qc_unavailable = False
     audio_qc_attempted = False
     all_audio_qc_passed = True
+    audio_qc_unavailable = False
     audio_retake_count = 0
     audio_warnings: list[str] = []
     elements_used: set[str] = set()
@@ -403,6 +405,7 @@ def run_factory_generation(
                         canonical_reference_paths=element_canonical_reference_paths(active_elements),
                     )
                     qc_attempted = qc_attempted or not qc.skipped
+                    qc_unavailable = qc_unavailable or qc.skipped
                     if qc.skipped and _qc_unavailable_is_fatal(effective_qc_mode == "strict"):
                         path.unlink(missing_ok=True)
                         raise RuntimeError(
@@ -459,6 +462,7 @@ def run_factory_generation(
                     audio_direction=request.audio_direction,
                 )
                 audio_qc_attempted = audio_qc_attempted or not audio_qc.skipped
+                audio_qc_unavailable = audio_qc_unavailable or audio_qc.skipped
                 strict_audio = (
                     request.enhance_prompt
                     and request.quality != "preview"
@@ -508,6 +512,7 @@ def run_factory_generation(
                             audio_direction=request.audio_direction,
                         )
                         audio_qc_attempted = audio_qc_attempted or not audio_qc.skipped
+                        audio_qc_unavailable = audio_qc_unavailable or audio_qc.skipped
                         if audio_qc.skipped:
                             if _qc_unavailable_is_fatal(strict_audio):
                                 accepted_path.unlink(missing_ok=True)
@@ -576,15 +581,26 @@ def run_factory_generation(
             output_duration_seconds=request.target_duration_seconds,
         )
 
+        visual_qc_status = (
+            "failed" if qc_attempted and not all_qc_passed else
+            "unavailable" if qc_unavailable else
+            "passed" if qc_attempted else "not_checked"
+        )
+        audio_qc_status = (
+            "failed" if audio_qc_attempted and not all_audio_qc_passed else
+            "unavailable" if audio_qc_unavailable else
+            "passed" if audio_qc_attempted else "not_checked"
+        )
+
         youtube_video_id: str | None = None
         youtube_url: str | None = None
         youtube_privacy: str | None = None
         # Never automatically publish a QC-rejected video. The master remains
         # available for download and explicit human review instead.
-        unapproved_qc = (qc_attempted and not all_qc_passed) or (audio_qc_attempted and not all_audio_qc_passed)
+        unapproved_qc = visual_qc_status in {"failed", "unavailable"} or audio_qc_status in {"failed", "unavailable"}
         if request.publish_to_youtube and unapproved_qc:
             continuity_warnings.append(
-                "Automatic YouTube publishing skipped because visual or audio QC failed. Review the saved video first."
+                "Automatic YouTube publishing skipped because visual or audio QC did not pass or could not complete. Review the saved video first."
             )
         if request.publish_to_youtube and not unapproved_qc:
             if progress:
@@ -608,6 +624,9 @@ def run_factory_generation(
         if request.continuity_mode != "off" and request.continuity_qc_mode != "off":
             qc_passed = all_qc_passed if qc_attempted else None
 
+        # Explicit QC states persist with the saved result. A nullable pass
+        # flag alone cannot distinguish provider outages from disabled QC.
+
         record_generation_metric(
             {
                 "type": "factory",
@@ -627,9 +646,11 @@ def run_factory_generation(
                 "entity_lock_count": len(plan.entity_locks),
                 "continuity_qc_mode": request.continuity_qc_mode,
                 "continuity_qc_passed": qc_passed,
+                "visual_qc_status": visual_qc_status,
                 "continuity_regenerations": continuity_regenerations,
                 "continuity_warning_count": len(continuity_warnings),
                 "audio_qc_passed": (all_audio_qc_passed if audio_qc_attempted else None),
+                "audio_qc_status": audio_qc_status,
                 "audio_retake_count": audio_retake_count,
                 "audio_warning_count": len(audio_warnings),
                 "render_mode": render_mode,
@@ -673,9 +694,11 @@ def run_factory_generation(
             continuity_id=continuity_id,
             entity_locks=plan.entity_locks,
             continuity_qc_passed=qc_passed,
+            visual_qc_status=visual_qc_status,
             continuity_regenerations=continuity_regenerations,
             continuity_warnings=continuity_warnings,
             audio_qc_passed=(all_audio_qc_passed if audio_qc_attempted else None),
+            audio_qc_status=audio_qc_status,
             audio_retake_count=audio_retake_count,
             audio_warnings=audio_warnings,
             elements_used=sorted(elements_used),

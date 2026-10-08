@@ -13,6 +13,7 @@ VideoModelName = Literal["ltx-2.5", "wan", "minimax"]
 DecoderName = Literal["conv", "diffusion"]
 ContinuityMode = Literal["off", "balanced", "strict"]
 ContinuityQCMode = Literal["off", "auto", "strict"]
+QualityCheckStatus = Literal["passed", "failed", "unavailable", "not_checked"]
 RealismProfile = Literal["standard", "real_skin", "identity_max"]
 JobStatusName = Literal["queued", "running", "completed", "failed"]
 JobStageName = Literal[
@@ -143,6 +144,7 @@ class VideoGenerationResponse(BaseModel):
     continuity_frame_url: str | None = None
     continuity_frame_filename: str | None = None
     continuity_qc_passed: bool | None = None
+    visual_qc_status: QualityCheckStatus = "not_checked"
     continuity_regenerations: int = 0
     continuity_warnings: list[str] = Field(default_factory=list)
     elements_used: list[str] = Field(default_factory=list)

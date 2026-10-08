@@ -34,6 +34,8 @@ import {
   waitForVideoGenerationJob,
 } from "@/lib/api/cinema";
 import type { AuthUser, ServerChatSession } from "@/lib/api/cinema";
+import { aggregateQCStatus, qcStatusLabel, resolveQCStatus } from "@/lib/qc-report";
+import type { QCStatus, VideoQCReport } from "@/lib/qc-report";
 import type {
   AspectRatio,
   AudioMode,
@@ -84,6 +86,7 @@ type FinalVideo = {
   gpu?: string | null;
   youtubeUrl?: string | null;
   youtubePrivacy?: string | null;
+  qcReport?: VideoQCReport;
 } | null;
 
 type StudioChatWorkspace = {
@@ -170,6 +173,8 @@ function createEmptyChatWorkspace(): StudioChatWorkspace {
 
 function normalizeChatWorkspace(value: Partial<StudioChatWorkspace> | null | undefined): StudioChatWorkspace {
   const empty = createEmptyChatWorkspace();
+  const savedVideo = value?.finalVideo;
+  const savedFactoryResult = value?.factoryResult;
   return {
     ...empty,
     ...(value || {}),
@@ -179,6 +184,22 @@ function normalizeChatWorkspace(value: Partial<StudioChatWorkspace> | null | und
     elementStrengths: value?.elementStrengths || {},
     scenePrompts: value?.scenePrompts || {},
     renderedVideos: value?.renderedVideos || {},
+    // Older saved Factory chats already contain verdicts, just not an attached
+    // per-video report. Recover their QC status when history is reopened.
+    finalVideo: savedVideo && !savedVideo.qcReport && savedFactoryResult && savedVideo.filename === savedFactoryResult.final_filename
+      ? { ...savedVideo, qcReport: factoryQCReport(savedFactoryResult) }
+      : savedVideo || null,
+  };
+}
+
+function factoryQCReport(response: FactoryGenerationResponse): VideoQCReport {
+  return {
+    visual: resolveQCStatus(response.visual_qc_status, response.continuity_qc_passed, true, response.continuity_warnings),
+    audio: resolveQCStatus(response.audio_qc_status, response.audio_qc_passed, response.audio_mode !== "mute", response.audio_warnings),
+    visualWarnings: response.continuity_warnings || [],
+    audioWarnings: response.audio_warnings || [],
+    visualRetries: response.continuity_regenerations || 0,
+    audioRetakes: response.audio_retake_count || 0,
   };
 }
 
@@ -1192,6 +1213,14 @@ export default function Home() {
       dimensions: `${response.media_info.width ?? "?"}×${response.media_info.height ?? "?"}`,
       estimatedCostUsd: response.estimated_cost_usd,
       gpu: response.gpu,
+      qcReport: {
+        visual: resolveQCStatus(response.visual_qc_status, response.continuity_qc_passed, true, response.continuity_warnings),
+        audio: "not_checked", // Direct/Storyboard scenes have visual QC but no separate semantic audio inspector.
+        visualWarnings: response.continuity_warnings || [],
+        audioWarnings: [],
+        visualRetries: response.continuity_regenerations || 0,
+        audioRetakes: 0,
+      },
     };
   }
 
@@ -1246,6 +1275,7 @@ export default function Home() {
         gpu: response.gpu,
         youtubeUrl: response.youtube_url,
         youtubePrivacy: response.youtube_privacy,
+        qcReport: factoryQCReport(response),
       });
       await refreshBilling();
     } finally {
@@ -1296,6 +1326,10 @@ export default function Home() {
           provider,
           model,
           continuity_mode: "off",
+          // Run visual QC without injecting continuity text into the native
+          // LTX speech prompt. A failed QC must never discard the render.
+          continuity_qc_mode: quality === "preview" ? "auto" : "strict",
+          continuity_max_retries: 0, // Display the verdict without charging for a surprise QC-triggered GPU rerender.
           element_bindings: elementBindings,
         });
         setFinalVideo(finalFromSceneResponse(response));
@@ -1374,6 +1408,7 @@ export default function Home() {
       continuityFrameUrl: response.continuity_frame_url ? absoluteApiUrl(response.continuity_frame_url) : null,
       continuityFrameFilename: response.continuity_frame_filename,
       continuityQcPassed: response.continuity_qc_passed,
+      visualQcStatus: response.visual_qc_status,
       continuityRegenerations: response.continuity_regenerations,
       continuityWarnings: response.continuity_warnings,
       elementsUsed: response.elements_used,
@@ -1437,6 +1472,19 @@ export default function Home() {
         hasAudio: combined.media_info.has_audio,
         audioCodec: combined.media_info.audio_codec,
         dimensions: `${combined.media_info.width ?? "?"}×${combined.media_info.height ?? "?"}`,
+        qcReport: {
+          visual: aggregateQCStatus(result.scenes.map((scene) => {
+            const rendered = completed[scene.id];
+            return resolveQCStatus(rendered.visualQcStatus, rendered.continuityQcPassed, rendered.continuityMode !== "off", rendered.continuityWarnings);
+          })),
+          audio: "not_checked", // Combining existing clips does not re-run audio QC.
+          visualWarnings: result.scenes.flatMap((scene) =>
+            (completed[scene.id].continuityWarnings || []).map((warning) => `Scene ${scene.id}: ${warning}`)
+          ),
+          audioWarnings: [],
+          visualRetries: result.scenes.reduce((total, scene) => total + (completed[scene.id].continuityRegenerations || 0), 0),
+          audioRetakes: 0,
+        },
       });
       await refreshBilling();
     } catch (err) {
@@ -1649,6 +1697,9 @@ export default function Home() {
                     <button type="button" className="studio-chat-open" onClick={() => handleOpenChat(session)} disabled={isBusy && !active} aria-current={active ? "page" : undefined} title={session.title}>
                       <span className="studio-chat-history-icon"><ChatIcon /></span>
                       <span className="studio-chat-history-name">{session.title}</span>
+                      {session.workspace.finalVideo?.qcReport && (
+                        session.workspace.finalVideo.qcReport.visual === "failed" || session.workspace.finalVideo.qcReport.audio === "failed"
+                      ) && <span title="This saved video failed quality control" className="shrink-0 text-[10px] font-semibold text-red-700 dark:text-red-300">QC failed</span>}
                     </button>
                     {!active ? (
                       <button type="button" className="studio-chat-delete" onClick={() => handleDeleteChat(session.id)} aria-label={`Delete ${session.title}`} title="Delete chat">
@@ -1667,6 +1718,8 @@ export default function Home() {
             <div className="studio-stage-header">
               <div className="flex items-center gap-2">
                 <div className="text-xs font-semibold text-[var(--text-strong)]">Scene</div>
+                {finalVideo?.qcReport && <><span className="text-[10px] text-[var(--text-muted)]">Visual QC</span><QCStatusPill status={finalVideo.qcReport.visual} /></>}
+                {finalVideo?.qcReport?.audio === "failed" && <><span className="text-[10px] text-[var(--text-muted)]">Audio QC</span><QCStatusPill status="failed" /></>}
                 {referencedElements.length > 0 && <span className="studio-mini-pill">{referencedElements.length} Element{referencedElements.length === 1 ? "" : "s"}</span>}
               </div>
               <div className="flex items-center gap-2">
@@ -2161,18 +2214,9 @@ export default function Home() {
             <Stat label="Delivery" value={qualityLabel(factoryResult.quality)} detail={`${factoryResult.width ?? "?"}×${factoryResult.height ?? "?"} · ${factoryResult.audio_mode}`} />
             <Stat label="Planner" value={factoryResult.planner_source} detail={`${factoryResult.entity_locks.length} entity lock${factoryResult.entity_locks.length === 1 ? "" : "s"}`} />
             <Stat label="Elements" value={factoryResult.elements_used.length ? String(factoryResult.elements_used.length) : "None"} detail={factoryResult.elements_used.length ? `${factoryResult.elements_used.join(", ")} · ${factoryResult.element_reference_mode || "reference"}` : "Prompt-only generation"} />
-            <Stat label="Continuity QC" value={factoryResult.continuity_qc_passed === true ? "Passed" : factoryResult.continuity_qc_passed === false ? "Failed — review" : "Guarded"} detail={`${factoryResult.continuity_regenerations} auto-regeneration${factoryResult.continuity_regenerations === 1 ? "" : "s"}`} />
-            <Stat label="Audio QC" value={factoryResult.audio_qc_passed === true ? "Passed" : factoryResult.audio_qc_passed === false ? "Failed" : "Guarded"} detail={`${factoryResult.audio_retake_count} LTX audio retake${factoryResult.audio_retake_count === 1 ? "" : "s"}`} />
+            <Stat label="Visual QC" value={qcStatusLabel(factoryQCReport(factoryResult).visual)} detail={`${factoryResult.continuity_regenerations} auto-regeneration${factoryResult.continuity_regenerations === 1 ? "" : "s"}`} />
+            <Stat label="Audio QC" value={qcStatusLabel(factoryQCReport(factoryResult).audio)} detail={`${factoryResult.audio_retake_count} LTX audio retake${factoryResult.audio_retake_count === 1 ? "" : "s"}`} />
           </section>
-        )}
-
-        {factoryResult && (factoryResult.continuity_warnings.length > 0 || factoryResult.audio_warnings.length > 0) && (
-          <div className="mt-3 rounded-xl border border-[var(--border)] bg-[var(--panel-bg)] px-4 py-3 text-xs text-[var(--text-muted)]">
-            <p className="font-semibold text-[var(--text)]">Generation completed with quality warnings — review before sharing</p>
-            {factoryResult.continuity_warnings.concat(factoryResult.audio_warnings).slice(0, 4).map((warning, index) => (
-              <p key={index} className="mt-1 leading-5">{warning}</p>
-            ))}
-          </div>
         )}
 
         {result && mode === "storyboard" && (
@@ -2211,7 +2255,22 @@ export default function Home() {
                       {isEditing ? (
                         <textarea value={scenePrompts[scene.id] || ""} onChange={(e) => updateScenePrompt(scene.id, e.target.value)} rows={8} className="mt-5 w-full resize-none rounded-xl border border-[var(--border)] bg-[var(--input-bg)] p-4 text-sm leading-6 text-[var(--text)] outline-none" />
                       ) : <p className="mt-5 line-clamp-6 text-sm leading-6 text-[var(--text-muted)]">{scenePrompts[scene.id]}</p>}
-                      {video && <div className="mt-4 rounded-xl bg-[var(--panel-subtle)] px-3 py-2 text-[11px] leading-5 text-[var(--text-muted)]">{video.details} · {video.chunkCount} chunk{video.chunkCount === 1 ? "" : "s"} · {video.renderSeconds.toFixed(1)}s render · {video.mediaInfo.has_audio ? `audio ${video.mediaInfo.audio_codec || "present"}` : "no audio"}{video.continuityMode === "strict" ? video.continuityApplied ? " · conditioned" : " · anchor" : ""}{video.continuityQcPassed === true ? " · QC passed" : video.continuityQcPassed === false ? " · QC warning" : ""}{video.continuityRegenerations ? ` · ${video.continuityRegenerations} auto-retry` : ""}</div>}
+                      {video && (
+                        <div className="mt-4 space-y-2">
+                          <div className="flex flex-wrap items-center gap-2 text-xs text-[var(--text)]">
+                            <span className="font-medium">Scene visual QC:</span>
+                            <QCStatusPill status={resolveQCStatus(video.visualQcStatus, video.continuityQcPassed, video.continuityMode !== "off", video.continuityWarnings)} />
+                            {video.continuityRegenerations > 0 && <span className="text-[var(--text-muted)]">{video.continuityRegenerations} retry attempt{video.continuityRegenerations === 1 ? "" : "s"}</span>}
+                          </div>
+                          {video.continuityWarnings?.length > 0 && (
+                            <details className="text-xs text-[var(--text-muted)]">
+                              <summary className="cursor-pointer">QC details ({video.continuityWarnings.length})</summary>
+                              {video.continuityWarnings.map((warning, warningIndex) => <p key={warningIndex} className="mt-1 leading-5">{warning}</p>)}
+                            </details>
+                          )}
+                          <div className="rounded-xl bg-[var(--panel-subtle)] px-3 py-2 text-[11px] leading-5 text-[var(--text-muted)]">{video.details} · {video.chunkCount} chunk{video.chunkCount === 1 ? "" : "s"} · {video.renderSeconds.toFixed(1)}s render · {video.mediaInfo.has_audio ? `audio ${video.mediaInfo.audio_codec || "present"}` : "no audio"}{video.continuityMode === "strict" ? video.continuityApplied ? " · conditioned" : " · anchor" : ""}</div>
+                        </div>
+                      )}
                       <div className="mt-5 flex items-center justify-between gap-3 border-t border-[var(--border)] pt-4">
                         <button type="button" disabled={isBusy && !isEditing} onClick={() => setEditingScene(isEditing ? null : scene.id)} className="h-9 rounded-lg px-3 text-xs text-[var(--text-muted)] hover:text-[var(--text)] disabled:opacity-40">{isEditing ? "Done editing" : "Edit prompt"}</button>
                         <div className="flex items-center gap-2">
@@ -2248,12 +2307,81 @@ function Stat({ label, value, detail }: { label: string; value: string; detail: 
   return <div className="rounded-2xl border border-[var(--border)] bg-[var(--panel-bg)] p-4"><div className="text-[10px] uppercase tracking-[0.16em] text-[var(--text-muted)]">{label}</div><div className="mt-2 text-lg font-semibold text-[var(--text)]">{value}</div><div className="mt-1 text-[11px] text-[var(--text-muted)]">{detail}</div></div>;
 }
 
+function QCStatusPill({ status }: { status: QCStatus }) {
+  const appearance = status === "failed"
+    ? "border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-300"
+    : status === "passed"
+      ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+      : status === "unavailable"
+        ? "border-amber-500/30 bg-amber-500/10 text-amber-800 dark:text-amber-300"
+        : "border-[var(--border)] bg-[var(--panel-subtle)] text-[var(--text-muted)]";
+  return <span className={`inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold ${appearance}`}>{qcStatusLabel(status)}</span>;
+}
+
+function VideoQCPanel({ report }: { report?: VideoQCReport }) {
+  // Old videos did not store a QC verdict. Never silently label them "Passed".
+  const visual = report?.visual || "unknown";
+  const audio = report?.audio || "unknown";
+  const hasFailure = visual === "failed" || audio === "failed";
+  const reviewNote = hasFailure
+    ? "QC failed: the MP4 is saved, but the result is not approved. Check the issues below before sharing."
+    : visual === "unavailable" || audio === "unavailable"
+      ? "QC could not complete. The video is available, but its quality is unverified."
+      : "QC status is saved with this video and will remain visible in chat history.";
+  return (
+    <section aria-label="Video quality control results" className="border-t border-[var(--border)] px-5 py-4 sm:px-6">
+      <div className="mb-3">
+        <h3 className="text-sm font-semibold text-[var(--text)]">Quality control results</h3>
+        <p className="mt-1 text-xs leading-5 text-[var(--text-muted)]">{reviewNote}</p>
+      </div>
+      <div className="grid gap-3 sm:grid-cols-2">
+        {([
+          { label: "Visual / identity QC", status: visual, warnings: report?.visualWarnings || [], attempts: report?.visualRetries || 0, retryLabel: "visual retries" },
+          { label: "Speech / audio QC", status: audio, warnings: report?.audioWarnings || [], attempts: report?.audioRetakes || 0, retryLabel: "audio retakes" },
+        ] as const).map((item) => (
+          <div key={item.label} className="rounded-xl border border-[var(--border)] bg-[var(--panel-subtle)] p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="text-xs font-semibold text-[var(--text)]">{item.label}</span>
+              <QCStatusPill status={item.status} />
+            </div>
+            {item.attempts > 0 && <p className="mt-2 text-[11px] text-[var(--text-muted)]">{item.attempts} {item.retryLabel}</p>}
+            {item.warnings.length > 0 ? (
+              <div className="mt-2 space-y-1">
+                {item.warnings.slice(0, 3).map((warning, index) => <p key={index} className="break-words text-xs leading-5 text-[var(--text-muted)]">{warning}</p>)}
+                {item.warnings.length > 3 && (
+                  <details className="text-xs text-[var(--text-muted)]">
+                    <summary className="cursor-pointer">Show {item.warnings.length - 3} more QC detail{item.warnings.length === 4 ? "" : "s"}</summary>
+                    {item.warnings.slice(3).map((warning, index) => <p key={index} className="mt-1 break-words leading-5">{warning}</p>)}
+                  </details>
+                )}
+              </div>
+            ) : (
+              <p className="mt-2 text-[11px] leading-5 text-[var(--text-muted)]">
+                {item.status === "passed" ? "Inspection completed without a detected violation." :
+                  item.status === "not_checked" ? "No separate inspection was performed." :
+                  item.status === "unknown" ? "This output does not contain a saved QC report." :
+                  item.status === "unavailable" ? "The quality-check provider could not complete this inspection." :
+                  "Review the rendered video carefully."}
+              </p>
+            )}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function FinalVideoCard({ video, aspectRatio }: { video: NonNullable<FinalVideo>; aspectRatio: AspectRatio }) {
+  const qcFailed = video.qcReport?.visual === "failed" || video.qcReport?.audio === "failed";
+  const qcUnavailable = video.qcReport?.visual === "unavailable" || video.qcReport?.audio === "unavailable";
   return (
     <div className="overflow-hidden rounded-3xl border border-[var(--border)] bg-[var(--panel-bg)]">
       <div className="flex flex-col gap-3 border-b border-[var(--border)] px-5 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
         <div>
-          <div className="flex items-center gap-2 text-sm font-medium text-[var(--text-strong)]">Final master <span className="rounded-full bg-emerald-500/10 px-2.5 py-1 text-[10px] text-[var(--accent-text)]">Ready</span></div>
+          <div className="flex flex-wrap items-center gap-2 text-sm font-medium text-[var(--text-strong)]">Final video
+            <span className="rounded-full bg-emerald-500/10 px-2.5 py-1 text-[10px] text-[var(--accent-text)]">Rendered</span>
+            {qcFailed ? <QCStatusPill status="failed" /> : qcUnavailable ? <QCStatusPill status="unavailable" /> : null}
+          </div>
           <div className="mt-1 text-xs text-[var(--text-muted)]">{video.label}</div>
           <div className="mt-1 text-[11px] text-[var(--text-faint)]">{video.dimensions} · {video.hasAudio ? `audio ${video.audioCodec || "present"}` : "no audio stream"}{video.gpu ? ` · ${video.gpu}` : ""}{video.estimatedCostUsd != null ? ` · est. $${video.estimatedCostUsd.toFixed(4)}` : ""}</div>
         </div>
@@ -2263,6 +2391,7 @@ function FinalVideoCard({ video, aspectRatio }: { video: NonNullable<FinalVideo>
         </div>
       </div>
       <div className={`mx-auto bg-black ${aspectRatio === "9:16" ? "max-w-[430px]" : aspectRatio === "1:1" ? "max-w-[760px]" : "w-full"}`}><video src={video.url} controls playsInline className={`w-full object-contain ${aspectClass(aspectRatio)}`} /></div>
+      <VideoQCPanel report={video.qcReport} />
       <div className="border-t border-[var(--border)] px-5 py-4 text-[11px] leading-5 text-[var(--text-muted)] sm:px-6">{video.qualityNote}</div>
     </div>
   );

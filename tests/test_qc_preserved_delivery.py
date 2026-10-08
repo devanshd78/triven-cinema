@@ -13,7 +13,9 @@ from app.services.continuity_qc import ContinuityQCResult
 
 
 class RetainQCRejectedVideoTests(unittest.TestCase):
-    def _run_fake_factory(self, *, preserve: bool, publish: bool = False) -> None:
+    def _run_fake_factory(self, *, preserve: bool, publish: bool = False,
+                          qc_override: ContinuityQCResult | None = None,
+                          expected_status: str = "failed") -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp)
             scene_video = output_dir / "scene.mp4"
@@ -48,7 +50,7 @@ class RetainQCRejectedVideoTests(unittest.TestCase):
                 final_video.write_bytes(b"FINAL_VIDEO")
                 return final_video
 
-            qc = ContinuityQCResult(
+            qc = qc_override or ContinuityQCResult(
                 passed=False,
                 duplicate_detected=True,
                 identity_drift_detected=True,
@@ -57,6 +59,7 @@ class RetainQCRejectedVideoTests(unittest.TestCase):
             )
             with ExitStack() as stack:
                 stack.enter_context(patch.object(settings, "factory_preserve_on_qc_failure", preserve))
+                stack.enter_context(patch.object(settings, "factory_qc_fail_open_on_unavailable", True))
                 stack.enter_context(patch.object(factory_service, "ensure_minimum_free_disk"))
                 stack.enter_context(patch.object(factory_service, "resolve_element_bindings", return_value=[]))
                 stack.enter_context(patch.object(factory_service, "create_prompt_only_plan", return_value=plan))
@@ -95,9 +98,17 @@ class RetainQCRejectedVideoTests(unittest.TestCase):
                 self.assertTrue(scene_video.exists(), "QC must not delete the rendered scene")
                 self.assertEqual(final_video.read_bytes(), b"FINAL_VIDEO")
                 self.assertEqual(result.final_filename, final_video.name)
-                self.assertFalse(result.continuity_qc_passed)
-                self.assertTrue(any("retained for review" in note for note in result.continuity_warnings))
-                self.assertTrue(any("split-screen" in note for note in result.continuity_warnings))
+                self.assertEqual(result.visual_qc_status, expected_status)
+                self.assertEqual(result.audio_qc_status, "not_checked")
+                if expected_status == "failed":
+                    self.assertFalse(result.continuity_qc_passed)
+                    self.assertTrue(any("retained for review" in note for note in result.continuity_warnings))
+                    self.assertTrue(any("split-screen" in note for note in result.continuity_warnings))
+                elif expected_status == "unavailable":
+                    self.assertIsNone(result.continuity_qc_passed)
+                    self.assertTrue(any("Gemini" in note for note in result.continuity_warnings))
+                else:
+                    self.assertTrue(result.continuity_qc_passed)
                 if publish:
                     uploader.assert_not_called()
                     self.assertIsNone(result.youtube_url)
@@ -111,3 +122,14 @@ class RetainQCRejectedVideoTests(unittest.TestCase):
 
     def test_legacy_strict_delete_can_be_reenabled(self):
         self._run_fake_factory(preserve=False)
+
+    def test_qc_pass_is_reported(self):
+        self._run_fake_factory(preserve=True, qc_override=ContinuityQCResult(passed=True), expected_status="passed")
+
+    def test_unavailable_qc_is_explicit_and_prevents_auto_publish(self):
+        self._run_fake_factory(
+            preserve=True,
+            publish=True,
+            qc_override=ContinuityQCResult(passed=True, skipped=True, note="Gemini HTTP 429"),
+            expected_status="unavailable",
+        )

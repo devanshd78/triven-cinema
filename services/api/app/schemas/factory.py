@@ -10,6 +10,7 @@ from app.schemas.generation import (
     EntityLock,
     DecoderName,
     RenderQuality,
+    QualityCheckStatus,
     RealismProfile,
     VideoModelName,
     VideoProviderName,
@@ -90,9 +91,11 @@ class FactoryGenerationResponse(BaseModel):
     continuity_id: str
     entity_locks: list[EntityLock] = Field(default_factory=list)
     continuity_qc_passed: bool | None = None
+    visual_qc_status: QualityCheckStatus = "not_checked"
     continuity_regenerations: int = 0
     continuity_warnings: list[str] = Field(default_factory=list)
     audio_qc_passed: bool | None = None
+    audio_qc_status: QualityCheckStatus = "not_checked"
     audio_retake_count: int = 0
     audio_warnings: list[str] = Field(default_factory=list)
     elements_used: list[str] = Field(default_factory=list)
