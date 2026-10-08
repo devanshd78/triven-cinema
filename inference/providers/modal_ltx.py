@@ -45,6 +45,9 @@ class ModalLTXProvider(VideoProvider):
             manifest = remote.remote(**arguments)
         except Exception as exc:
             detail = (str(exc) or type(exc).__name__).strip().replace("\n", " ")[:500]
+            if "workspace" in detail.lower() and "disabled" in detail.lower():
+                raise RuntimeError("Modal workspace is disabled. Restore workspace access in the Modal dashboard "
+                                   "or contact Modal support before retrying. The readiness check could not run.") from exc
             raise RuntimeError("Modal inference preflight failed before GPU allocation. Verify Modal authentication and "
                                f"deploy the current compatible worker with `modal deploy modal/app.py`. App: {self.app_name}. {detail}") from exc
         if not isinstance(manifest, dict) or manifest.get("protocol_version") != 2:

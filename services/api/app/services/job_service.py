@@ -427,6 +427,18 @@ def safe_job_error(exc: Exception, stage: str = "rendering") -> str:
     if isinstance(exc, ValueError):
         # Application validation errors are deliberately written for the caller.
         message = detail
+    elif "workspace" in lower and "disabled" in lower:
+        message = ("The Modal workspace is disabled, so video generation cannot start. "
+                   "Restore workspace access in the Modal dashboard or contact Modal support, "
+                   "then run `python scripts/check_inference.py --all` before retrying.")
+    elif "preflight" in lower and any(word in lower for word in ("not found", "lookup failed")):
+        message = ("The deployed Modal worker is missing its readiness-check function. "
+                   "Deploy the updated worker with `modal deploy modal/app.py`, then run "
+                   "`python scripts/check_inference.py --all` before retrying.")
+    elif "worker protocol" in lower or "worker ltx revision mismatch" in lower:
+        message = ("The deployed Modal worker does not match this application. "
+                   "Deploy `modal/app.py` with the same TRIVEN_LTX_REPO_REF as the API, "
+                   "then run `python scripts/check_inference.py --all` before retrying.")
     elif any(word in lower for word in ("weights", "checkpoint", "lora", "model file", "preflight", "worker version")):
         message = "Inference setup is incomplete or incompatible. Validate model weights, LoRAs and the deployed Modal worker before retrying."
     elif any(word in lower for word in ("unauthenticated", "authentication", "unauthorized", "token", "credential")):

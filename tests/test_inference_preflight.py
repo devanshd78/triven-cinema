@@ -52,6 +52,16 @@ class InferencePreflightTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Verify Modal authentication"):
                 ModalLTXProvider().preflight()
 
+    def test_disabled_workspace_stops_before_gpu_and_explains_account_recovery(self):
+        endpoint = Mock()
+        endpoint.remote.side_effect = RuntimeError('workspace ac-private-workspace is disabled')
+        with patch('inference.providers.modal_ltx.modal.Function.from_name', return_value=endpoint) as lookup:
+            with self.assertRaisesRegex(RuntimeError, 'Modal workspace is disabled') as error:
+                ModalLTXProvider().generate('presenter', 512, 512, 5, 42, 'conv')
+        self.assertEqual(lookup.call_count, 1)
+        self.assertNotIn('ac-private-workspace', str(error.exception))
+        self.assertNotIn('modal deploy', str(error.exception))
+
     def test_wrong_ltx_revision_rejected_before_gpu_rpc(self):
         endpoint = Mock()
         endpoint.remote.return_value = {"protocol_version": 2, "ltx_repo_ref": "v1.4.1", "ready": True}
