@@ -203,6 +203,8 @@ Return ONLY JSON with exactly this shape:
                 parts=parts,
                 max_output_tokens=1400,
                 timeout_seconds=settings.continuity_qc_timeout_seconds,
+                total_timeout_seconds=settings.quality_check_retry_budget_seconds,
+                max_attempts_per_model=1,
                 thinking_level="low",
             )
             payload = json.loads(_extract_json_text(response.payload))

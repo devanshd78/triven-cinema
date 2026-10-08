@@ -395,7 +395,8 @@ def run_factory_generation(
                     except Exception as exc:
                         qc = ContinuityQCResult(skipped=True, note=f"Visual QC unavailable ({type(exc).__name__}).")
                 visual_report = qc_report(qc)
-                scene_attempts.append({"filename": path.name, "attempt": attempt + 1, **visual_report})
+                scene_attempts.append({"filename": path.name, "attempt": attempt + 1, **visual_report,
+                                       "timings_seconds": getattr(result, "timings_seconds", {})})
                 register_render(workspace_id, path, kind="scene", scene_index=index,
                                 visual_qc_status=visual_report["status"], visual_qc=visual_report,
                                 visual_qc_attempts=scene_attempts)
@@ -422,6 +423,7 @@ def run_factory_generation(
                 scene_prompt=scene.prompt, spoken_script=scene_script,
                 audio_direction=request.audio_direction, audio_mode=request.audio_mode,
                 duration_seconds=duration, seed=_scene_seed(request.seed, index), scene_index=index,
+                progress=(lambda message: progress("rendering", min(79, base_progress + 3), f"Scene {index + 1}/{scene_count} · {message}")) if progress else None,
             )
             accepted_path = audio_review.path
             audio_warnings.extend(audio_review.warnings)

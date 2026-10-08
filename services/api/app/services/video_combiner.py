@@ -1,9 +1,14 @@
+import logging
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
 from app.core.config import settings
 from app.services.media_probe import probe_media
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class VideoCombineError(RuntimeError):
@@ -152,9 +157,16 @@ def combine_videos(video_paths: list[Path], output_path: Path) -> Path:
     temporary_normalized: list[Path] = []
 
     try:
-        media = [probe_media(path) for path in video_paths]
+        media = [probe_media(path, include_concat_signature=True) for path in video_paths]
         any_audio = any(item.get("has_audio") for item in media)
         all_audio = all(item.get("has_audio") for item in media)
+        signature = media[0].get("concat_signature")
+        copy_video = bool(signature) and all(item.get("concat_signature") == signature for item in media)
+
+        if len(video_paths) == 1 and copy_video and "mp4" in (media[0].get("format_name") or "").split(","):
+            if video_paths[0].resolve() != output_path.resolve():
+                shutil.copyfile(video_paths[0], output_path)
+            return output_path
 
         normalized_paths = list(video_paths)
         if any_audio and not all_audio:
@@ -189,23 +201,25 @@ def combine_videos(video_paths: list[Path], output_path: Path) -> Path:
             "0",
             "-i",
             str(concat_file),
-            "-c:v",
-            "libx264",
-            "-preset",
-            "fast",
-            "-crf",
-            "18",
-            "-pix_fmt",
-            "yuv420p",
         ]
-
+        encode_options = ["-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p"]
+        audio_options = []
         if any_audio:
-            command.extend(["-c:a", "aac", "-b:a", "192k"])
+            audio_options.extend(["-c:a", "aac", "-b:a", "192k"])
         else:
-            command.append("-an")
+            audio_options.append("-an")
 
-        command.extend(["-movflags", "+faststart", str(output_path)])
-        _run_ffmpeg(command)
+        output_options = audio_options + ["-movflags", "+faststart", str(output_path)]
+        if copy_video:
+            try:
+                # Audio is still normalized across scene boundaries. Copying
+                # compatible picture packets avoids a full extra video encode.
+                _run_ffmpeg(command + ["-c:v", "copy"] + output_options)
+            except VideoCombineError:
+                LOGGER.warning("Video stream copy failed; retrying composition with encoding.")
+                _run_ffmpeg(command + encode_options + output_options)
+        else:
+            _run_ffmpeg(command + encode_options + output_options)
 
         if not output_path.exists():
             raise VideoCombineError("FFmpeg completed but final video was not created.")

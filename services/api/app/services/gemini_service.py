@@ -40,6 +40,8 @@ def generate_content(
     timeout_seconds: float | None = None,
     thinking_level: str | None = None,
     primary_model: str | None = None,
+    total_timeout_seconds: float | None = None,
+    max_attempts_per_model: int | None = None,
 ) -> GeminiResponse:
     """Call Gemini with bounded retry + stable-model failover.
 
@@ -50,9 +52,11 @@ def generate_content(
     if not settings.gemini_api_key:
         raise RuntimeError("GEMINI_API_KEY is not configured.")
 
-    attempts_per_model = max(1, int(settings.gemini_max_attempts_per_model))
+    attempts_per_model = max(1, int(settings.gemini_max_attempts_per_model if max_attempts_per_model is None else max_attempts_per_model))
     base_delay = max(0.0, float(settings.gemini_retry_backoff_seconds))
-    timeout = httpx.Timeout(timeout_seconds or settings.gemini_timeout_seconds)
+    request_timeout = max(0.1, float(timeout_seconds or settings.gemini_timeout_seconds))
+    budget = max(0.1, float(settings.gemini_retry_budget_seconds if total_timeout_seconds is None else total_timeout_seconds))
+    deadline = time.monotonic() + budget
     level = (thinking_level or settings.gemini_thinking_level).strip().lower()
     if level not in {"low", "medium", "high"}:
         level = "low"
@@ -66,6 +70,10 @@ def generate_content(
             f"{model}:generateContent"
         )
         for attempt in range(attempts_per_model):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(f"Gemini retry time budget exhausted after {total_attempts} attempts. {last_error}")
+            timeout = httpx.Timeout(min(request_timeout, remaining))
             total_attempts += 1
             try:
                 response = httpx.post(
@@ -109,6 +117,9 @@ def generate_content(
             if not retryable:
                 break
             if attempt < attempts_per_model - 1 and base_delay > 0:
-                time.sleep(base_delay * (2**attempt))
+                delay = base_delay * (2**attempt)
+                if delay >= deadline - time.monotonic():
+                    raise RuntimeError(f"Gemini retry time budget exhausted after {total_attempts} attempts. {last_error}")
+                time.sleep(delay)
 
     raise RuntimeError(last_error)

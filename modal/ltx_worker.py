@@ -16,6 +16,7 @@ from models import (
 
 
 LTX_REPO = Path("/opt/LTX-2")
+LTX_PYTHON = LTX_REPO / ".venv" / "bin" / "python"
 
 
 def frames_for_duration(duration_seconds: float, fps: int = 24) -> int:
@@ -175,9 +176,7 @@ def build_command(
     pipeline_module = "ltx_pipelines.ic_lora" if use_ingredients else ("ltx_pipelines.dfr_pipeline" if mode == "dfr" else "ltx_pipelines.distilled")
 
     command = [
-        "uv",
-        "run",
-        "python",
+        str(LTX_PYTHON),
         "-m",
         pipeline_module,
         "--transformer-path",
@@ -304,7 +303,7 @@ def build_refine_details_command(
     the upstream IC-LoRA pipeline.
     """
     command = [
-        "uv", "run", "python", "-m", "ltx_pipelines.ic_lora",
+        str(LTX_PYTHON), "-m", "ltx_pipelines.ic_lora",
         "--transformer-path", str(TRANSFORMER),
         "--text-encoder-path", str(TEXT_ENCODER),
         "--video-vae-path", str(VIDEO_VAE_DIFFUSION),

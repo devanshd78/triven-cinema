@@ -109,7 +109,9 @@ class RenderRecoveryTests(unittest.TestCase):
 
     def test_failed_audio_repair_preserves_video_and_reason(self):
         with fake_factory(audio=AudioQCResult(passed=False, note="Wrong dialogue"), fail_retake=True) as state:
-            result = factory.run_factory_generation(request(audio_mode="native"), workspace_id="audit")
+            progress = Mock()
+            result = factory.run_factory_generation(request(audio_mode="native"), workspace_id="audit", progress=progress)
+            self.assertTrue(any('Correcting audio on the GPU' in call.args[2] for call in progress.call_args_list))
             self.assertEqual(result.audio_qc_status, "failed")
             self.assertTrue(state.paths[0].exists())
             self.assertTrue(any("repair unavailable" in text for text in result.audio_warnings))

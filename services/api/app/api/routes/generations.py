@@ -316,7 +316,8 @@ def _generate_video_impl(
             except Exception as exc:
                 qc = ContinuityQCResult(skipped=True, note=f"Visual QC unavailable ({type(exc).__name__}).")
         visual_report = qc_report(qc)
-        scene_attempts.append({"filename": source_path.name, "attempt": attempt + 1, **visual_report})
+        scene_attempts.append({"filename": source_path.name, "attempt": attempt + 1, **visual_report,
+                               "timings_seconds": getattr(result, "timings_seconds", {})})
         register_render(workspace_id, source_path, kind="scene", scene_index=request.scene_index or 0,
                         visual_qc_status=visual_report["status"], visual_qc=visual_report,
                         visual_qc_attempts=scene_attempts)
@@ -341,6 +342,7 @@ def _generate_video_impl(
         source_path, provider=provider, workspace_id=workspace_id, scene_prompt=prompt_base,
         spoken_script=spoken_script, audio_direction=request.audio_direction, audio_mode=request.audio_mode,
         duration_seconds=request.duration_seconds, seed=request.seed, scene_index=request.scene_index or 0,
+        progress=(lambda message: progress("rendering", 72, message)) if progress else None,
     )
     source_path = audio_review.path
     if audio_review.retake is not None:

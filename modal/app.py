@@ -182,6 +182,7 @@ def generate_video(
         )
 
     started = time.perf_counter()
+    timings_seconds = {}
     output_path = Path("/tmp") / f"ltx-{uuid.uuid4().hex}.mp4"
     base_output_path = output_path if not apply_detail_refiner else Path("/tmp") / f"ltx-base-{uuid.uuid4().hex}.mp4"
     refined_picture_path = None if not apply_detail_refiner else Path("/tmp") / f"ltx-refined-{uuid.uuid4().hex}.mp4"
@@ -211,6 +212,7 @@ def generate_video(
         )
 
     try:
+        timings_seconds["reference_preparation"] = round(time.perf_counter() - started, 3)
         command = build_command(
             prompt=prompt,
             output_path=base_output_path,
@@ -225,10 +227,16 @@ def generate_video(
             element_reference_video_path=element_reference_video_path,
             element_reference_strength=element_reference_strength,
         )
+        print(f"Starting base generation: {duration_seconds:g}s, {width}x{height}, {mode}", flush=True)
+        base_started = time.perf_counter()
         run_ltx_command(command)
+        timings_seconds["base_generation"] = round(time.perf_counter() - base_started, 3)
+        print(f"Base generation finished in {timings_seconds['base_generation']}s", flush=True)
         if apply_detail_refiner:
             assert refined_picture_path is not None
+            refine_started = time.perf_counter()
             try:
+                print("Starting additional detail refinement pass", flush=True)
                 refine_command = build_refine_details_command(
                     input_video_path=base_output_path,
                     output_path=refined_picture_path,
@@ -251,6 +259,9 @@ def generate_video(
                 output_path.unlink(missing_ok=True)
                 output_path = base_output_path
                 refinement_warning = f"Refinement unavailable; base render preserved ({type(exc).__name__}: {str(exc)[:300]})"
+            finally:
+                timings_seconds["detail_refinement"] = round(time.perf_counter() - refine_started, 3)
+                print(f"Detail refinement finished in {timings_seconds['detail_refinement']}s", flush=True)
     finally:
         if reference_path is not None:
             reference_path.unlink(missing_ok=True)
@@ -292,6 +303,7 @@ def generate_video(
             + (f" · WARNING: {refinement_warning}" if refinement_warning else "")
         ),
         "render_seconds": elapsed,
+        "timings_seconds": timings_seconds,
         "gpu": GPU_TYPE,
         "reference_conditioned": bool(reference_image_bytes or element_reference_sheet_bytes),
         "chunk_count": (

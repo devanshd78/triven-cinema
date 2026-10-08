@@ -309,6 +309,18 @@ Runtime databases and Character uploads are no longer tracked in Git. **Before t
 
 `./scripts/run_tests.sh` runs tests in an isolated temporary copy with empty runtime state. `./scripts/verify_mvp.sh` also checks syntax, frontend regression tests, lint and the production build. Tests do not establish real GPU image quality; validate speech, identity, transitions and runtime with representative renders after deploying.
 
+## Generation latency
+
+Generation runs sequentially when scenes depend on the previous approved frame. Real Skin and Identity Max add a separate texture refinement pass; failed visual QC can render another candidate, and failed audio QC can add an audio-only GPU repair. These operations can dominate runtime, so a long render is not necessarily a queue delay.
+
+Quality inspections use one attempt per configured Gemini model within `QUALITY_CHECK_RETRY_BUDGET_SECONDS` (45 seconds by default). Planner retries share `GEMINI_RETRY_BUDGET_SECONDS` (90 seconds). HTTP timeouts shrink to the remaining retry budget; expired inspections report QC unavailable and preserve the clip. They do not approve unchecked video. Generation and refinement invoke the image's preinstalled Python environment directly without repeating `uv run` dependency resolution. Worker logs and saved attempt metadata separate base generation, refinement, readiness, and queue/startup/transfer time.
+
+Composition copies a single compatible MP4 unchanged and joins compatible H.264 scene pictures without another video encode. Codec headers, dimensions, frame rate, time base, and stream layout must match; incompatible inputs or a failed stream copy use the encoding fallback. Delivery still applies the requested final dimensions, and joined audio is normalized as before.
+
+For a faster draft, select Preview and Standard in the existing controls; Character references still apply. Select final resolution and the desired realism profile when preparing the final take. No preset or latency optimization silently lowers the chosen resolution, skips identity conditioning, or treats unavailable QC as passed.
+
+API retry/progress changes require an API rebuild; worker startup/timing changes require `modal deploy modal/app.py`. GPU speedup must be measured with comparable real renders after readiness passes.
+
 ## Character continuity for multi-scene stories
 
 Storyboard mode now defaults to **Strict continuity**. Triven creates one shared character bible and one shared visual-style bible, injects the same immutable identity locks into every scene prompt, and keeps the same seed across the whole story. After each rendered scene, FastAPI extracts the final video frame. The next Modal/LTX-2.5 render receives that PNG as frame-0 image conditioning, so the next clip starts from the actual visual identity produced by the previous clip instead of reinterpreting the character from text alone.

@@ -9,7 +9,7 @@ class MediaProbeError(RuntimeError):
     pass
 
 
-def probe_media(path: Path) -> dict:
+def probe_media(path: Path, *, include_concat_signature: bool = False) -> dict:
     if not path.exists():
         raise MediaProbeError(f"Media file does not exist: {path}")
 
@@ -21,8 +21,10 @@ def probe_media(path: Path) -> dict:
         "-show_format",
         "-of",
         "json",
-        str(path),
     ]
+    if include_concat_signature:
+        command.extend(["-show_data_hash", "sha256"])
+    command.append(str(path))
     try:
         process = subprocess.run(
             command,
@@ -60,7 +62,7 @@ def probe_media(path: Path) -> dict:
         except (TypeError, ValueError):
             duration = None
 
-    return {
+    result = {
         "width": int(video_stream.get("width")) if video_stream and video_stream.get("width") else None,
         "height": int(video_stream.get("height")) if video_stream and video_stream.get("height") else None,
         "duration_seconds": duration,
@@ -71,3 +73,30 @@ def probe_media(path: Path) -> dict:
         "format_name": (payload.get("format") or {}).get("format_name"),
         "size_bytes": path.stat().st_size,
     }
+    if include_concat_signature:
+        # Concat's stream-copy path requires identical stream layouts, timing,
+        # and codec headers. Missing metadata or unusual streams use encoding.
+        fields = (
+            "codec_type", "codec_name", "codec_tag_string", "profile", "level",
+            "time_base", "extradata_hash", "width", "height", "pix_fmt",
+            "field_order", "sample_aspect_ratio", "color_range", "color_space",
+            "color_transfer", "color_primaries", "chroma_location", "has_b_frames",
+            "r_frame_rate", "avg_frame_rate", "sample_fmt", "sample_rate",
+            "channels", "channel_layout",
+        )
+        supported = (
+            [stream.get("codec_type") for stream in streams] in (["video"], ["video", "audio"])
+            and video_stream.get("codec_name") == "h264"
+            and video_stream.get("pix_fmt") == "yuv420p"
+            and all(video_stream.get(key) for key in ("width", "height", "time_base", "r_frame_rate", "extradata_hash"))
+            and not any(stream.get("side_data_list") for stream in streams)
+            and (audio_stream is None or (
+                audio_stream.get("codec_name") == "aac"
+                and all(audio_stream.get(key) for key in ("time_base", "sample_rate", "channels", "extradata_hash"))
+            ))
+        )
+        result["concat_signature"] = (
+            [{field: stream.get(field) for field in fields} for stream in streams]
+            if supported else None
+        )
+    return result

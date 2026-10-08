@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     gemini_fallback_models: str = "gemini-3.7-flash,gemini-3.6-flash"
     gemini_max_attempts_per_model: int = 3
     gemini_retry_backoff_seconds: float = 0.8
+    gemini_retry_budget_seconds: float = 90.0
+    quality_check_retry_budget_seconds: float = 45.0
 
     video_provider: str = "huggingface"
     hf_token: str = ""

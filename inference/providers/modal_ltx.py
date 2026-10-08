@@ -104,8 +104,11 @@ class ModalLTXProvider(VideoProvider):
                 raise FileNotFoundError(f"Element reference sheet not found: {sheet.name}")
             element_reference_sheet_bytes = sheet.read_bytes()
 
+        readiness_started = time.perf_counter()
         self.preflight(render_mode=render_mode, realism_profile=realism_profile,
                        element_reference_required=bool(element_reference_sheet_bytes), decoder=decoder)
+        readiness_seconds = time.perf_counter() - readiness_started
+        remote_started = time.perf_counter()
 
         try:
             remote_function = modal.Function.from_name(self.app_name, self.function_name)
@@ -145,6 +148,10 @@ class ModalLTXProvider(VideoProvider):
 
         wall_elapsed = time.perf_counter() - started
         elapsed = float(result.get("render_seconds") or 0.0) or wall_elapsed
+        remote_seconds = time.perf_counter() - remote_started
+        timings_seconds = {**(result.get("timings_seconds") or {}),
+                           "readiness_check": round(readiness_seconds, 3),
+                           "queue_startup_transfer": round(max(0.0, remote_seconds - elapsed), 3)}
         return VideoGenerationResult(
             filename=destination.name,
             path=str(destination),
@@ -160,6 +167,7 @@ class ModalLTXProvider(VideoProvider):
             render_mode=str(result.get("render_mode") or render_mode),
             realism_profile=str(result.get("realism_profile") or realism_profile),
             detail_refined=bool(result.get("detail_refined", False)),
+            timings_seconds=timings_seconds,
         )
 
     def retake_audio(

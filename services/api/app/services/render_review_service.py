@@ -2,6 +2,7 @@
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from app.core.config import settings
 from app.services.audio_qc import AudioQCResult, evaluate_scene_audio
@@ -52,6 +53,7 @@ def review_audio(
     path: Path, *, provider, workspace_id: str | None, scene_prompt: str,
     spoken_script: str, audio_direction: str | None, audio_mode: str,
     duration_seconds: float, seed: int, scene_index: int, allow_retake: bool = True,
+    progress: Callable[[str], None] | None = None,
 ) -> AudioReview:
     if audio_mode == "mute":
         return AudioReview(path, qc_report(reason="Audio was intentionally muted; speech QC is not applicable."))
@@ -68,10 +70,14 @@ def review_audio(
             result = AudioQCResult(passed=False, skipped=True, note=f"Audio QC unavailable ({type(exc).__name__}).")
         return qc_report(result)
 
+    if progress:
+        progress("Checking dialogue and audio quality...")
     initial = inspect(path)
     review = AudioReview(path, initial, attempts=[{"filename": path.name, **initial}])
     if allow_retake and initial["status"] == "failed" and getattr(provider, "supports_audio_retake", False) and settings.factory_audio_retake_enabled:
         try:
+            if progress:
+                progress("Correcting audio on the GPU; the existing picture is preserved...")
             # Only the immutable script and sound direction enter the audio repair.
             retake = provider.retake_audio(
                 video_path=str(path),
@@ -85,6 +91,8 @@ def review_audio(
                             audio_qc_status="not_checked")
             review.retake = retake
             review.path = candidate
+            if progress:
+                progress("Checking the corrected audio...")
             review.report = inspect(candidate)
             review.attempts.append({"filename": candidate.name, **review.report})
         except Exception as exc:

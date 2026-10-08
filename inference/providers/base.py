@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -19,6 +19,7 @@ class VideoGenerationResult:
     render_mode: str = "distilled"
     realism_profile: str = "standard"
     detail_refined: bool = False
+    timings_seconds: dict[str, float] = field(default_factory=dict)
 
 
 class VideoProvider(ABC):

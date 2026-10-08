@@ -16,6 +16,16 @@ spec.loader.exec_module(ltx_worker)
 
 
 class ModalLongVideoTests(unittest.TestCase):
+    def test_generation_and_refinement_use_built_environment_without_uv_sync(self):
+        generation = ltx_worker.build_command(prompt='presenter', output_path=Path('/tmp/out.mp4'),
+                                             width=1024, height=576, duration_seconds=5, seed=42, decoder='conv')
+        refinement = ltx_worker.build_refine_details_command(input_video_path=Path('/tmp/in.mp4'),
+                output_path=Path('/tmp/out.mp4'), width=1024, height=576, duration_seconds=5, seed=42)
+        for command in (generation, refinement):
+            self.assertEqual(command[:2], ['/opt/LTX-2/.venv/bin/python', '-m'])
+            self.assertNotIn('uv', command)
+            self.assertEqual(command[command.index('--quantization') + 1], 'fp8-cast')
+
     def test_thirty_second_clip_uses_native_temporal_windowing(self):
         command = ltx_worker.build_command(
             prompt="A continuous cinematic tracking shot with synchronized natural audio.",

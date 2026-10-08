@@ -148,6 +148,8 @@ Return ONLY JSON:
                 parts=parts,
                 max_output_tokens=1000,
                 timeout_seconds=max(settings.gemini_timeout_seconds, 30.0),
+                total_timeout_seconds=settings.quality_check_retry_budget_seconds,
+                max_attempts_per_model=1,
                 thinking_level="low",
             )
             payload = json.loads(_extract_json_text(response.payload))

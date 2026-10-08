@@ -19,6 +19,7 @@ def _register_render(result: VideoGenerationResult, *, part: int | None = None) 
     register_current_generated_asset(result.filename, metadata={
         "render_state": "generated", "visual_qc_status": "not_checked", "audio_qc_status": "not_checked",
         "continuation_part": part, "provider": result.provider,
+        "timings_seconds": getattr(result, "timings_seconds", {}),
     })
 
 
