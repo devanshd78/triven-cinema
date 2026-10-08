@@ -193,16 +193,24 @@ def _decode_image(upload: UploadedElementAsset) -> PreparedElementAsset:
             image.load()
             normalized = ImageOps.exif_transpose(image)
             normalized = normalized.convert("RGBA" if "A" in normalized.getbands() or "transparency" in normalized.info else "RGB")
+            # Bound stored and downstream decoding cost for high-resolution phone
+            # photos. Reference sheets are much smaller than this working copy.
+            normalized.thumbnail((4096, 4096), Image.Resampling.LANCZOS)
             output = BytesIO()
-            normalized.save(output, format="PNG")
+            encoded_format = "JPEG" if fmt in {"JPEG", "WEBP"} and normalized.mode == "RGB" else "PNG"
+            if encoded_format == "JPEG":
+                normalized.save(output, format="JPEG", quality=95, subsampling=0)
+            else:
+                normalized.save(output, format="PNG")
             width, height = normalized.size
     except ElementError:
         raise
     except Exception as exc:
         raise ElementError("Cannot decode this image. Export it as PNG, JPEG, or WEBP and try again.") from exc
+    mime = "image/jpeg" if encoded_format == "JPEG" else "image/png"
     return PreparedElementAsset(
-        UploadedElementAsset(upload.original_filename, "image/png", output.getvalue(), upload.role),
-        "image/png", int(width), int(height),
+        UploadedElementAsset(upload.original_filename, mime, output.getvalue(), upload.role),
+        mime, int(width), int(height),
     )
 
 
@@ -699,7 +707,7 @@ def compile_element_prompt(scene_prompt: str, bindings: list[ResolvedElementBind
     action = scene_prompt
     for binding in bindings:
         action = re.sub(
-            rf"(?<![A-Za-z0-9_])@{re.escape(binding.handle)}\b",
+            rf"(?<![A-Za-z0-9_])@{re.escape(binding.handle)}(?![A-Za-z0-9_-])",
             binding.name,
             action,
             flags=re.IGNORECASE,

@@ -4,7 +4,10 @@ import { useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import Image from "next/image";
 import { ReferenceUploadPreview } from "@/components/ReferenceUploadPreview";
-import { referenceFileKey, selectReferenceFiles } from "@/lib/element-uploads";
+import { StudioVideo } from "@/components/StudioVideo";
+import { studioPlayback } from "@/lib/media-playback";
+import { referenceFileKey, referenceRoles, selectReferenceFiles } from "@/lib/element-uploads";
+import { appliesToAllScenes, hasElementMention } from "@/lib/element-references";
 
 import {
   absoluteApiUrl,
@@ -463,26 +466,8 @@ function escapeRegExp(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function hasElementMention(text: string, handle: string) {
-  return new RegExp(`(^|[^A-Za-z0-9_])@${escapeRegExp(handle)}\\b`, "i").test(text);
-}
-
 function primaryElementAsset(element: CinemaElement) {
   return element.assets.find((asset) => asset.id === element.primary_asset_id) || element.assets[0] || null;
-}
-
-function suggestedElementRoles(
-  type: ElementType,
-  count: number,
-  existing: ElementAssetRole[] = []
-): ElementAssetRole[] {
-  if (type === "character") {
-    const preferred: ElementAssetRole[] = ["face", "full_body", "profile", "costume"];
-    const available = preferred.filter((role) => !existing.includes(role));
-    return Array.from({ length: count }, (_, index) => available[index] || "support");
-  }
-  const role: ElementAssetRole = type === "prop" ? "object" : type === "location" ? "location" : "style";
-  return Array.from({ length: count }, () => role);
 }
 
 function elementRoleLabel(role: ElementAssetRole) {
@@ -494,21 +479,6 @@ function elementTone(type: ElementType) {
   if (type === "prop") return "element-prop";
   if (type === "location") return "element-location";
   return "element-style";
-}
-
-function PromptHighlight({ text, elements }: { text: string; elements: CinemaElement[] }) {
-  const byHandle = new Map(elements.map((element) => [element.handle.toLowerCase(), element]));
-  const parts = text.split(/(@[A-Za-z0-9_-]+)/g);
-  return (
-    <div className="studio-prompt-highlight" aria-hidden="true">
-      {parts.map((part, index) => {
-        if (!part.startsWith("@")) return <span key={`${index}-${part.slice(0, 8)}`}>{part}</span>;
-        const element = byHandle.get(part.slice(1).toLowerCase());
-        if (!element) return <span key={`${index}-${part}`}>{part}</span>;
-        return <span key={`${index}-${part}`} className={`studio-inline-mention ${elementTone(element.type)}`}>{part}</span>;
-      })}
-    </div>
-  );
 }
 
 export default function Home() {
@@ -642,7 +612,7 @@ export default function Home() {
       reference_mode: elementModes[element.id] || "identity",
       wardrobe_policy: element.type === "character" ? (elementWardrobePolicies[element.id] || "reference") : "reference",
       strength: Math.max(0, Math.min(1, elementStrengths[element.id] ?? 1.0)),
-      apply_to_all_scenes: Boolean(elementApplyAll[element.id]),
+      apply_to_all_scenes: appliesToAllScenes(element.type, elementApplyAll[element.id]),
     })),
     [referencedElements, activeElementLimit, elementModes, elementWardrobePolicies, elementStrengths, elementApplyAll]
   );
@@ -679,6 +649,11 @@ export default function Home() {
   );
 
   const overlayOpen = showElementCreator || showReferencePicker || showElementsLibrary;
+  useEffect(() => {
+    studioPlayback.pauseAll();
+    return () => studioPlayback.pauseAll();
+  }, [activeChatId, authUser?.id, mode, studioVideoUrl, overlayOpen]);
+
   useEffect(() => {
     if (!overlayOpen) return;
     const previous = document.body.style.overflow;
@@ -1042,6 +1017,7 @@ export default function Home() {
   }
 
   function applyChatWorkspace(rawWorkspace: StudioChatWorkspace) {
+    studioPlayback.pauseAll();
     const workspace = normalizeChatWorkspace(rawWorkspace);
     setServerJobs([]);
     setPrompt(workspace.prompt);
@@ -1194,6 +1170,8 @@ export default function Home() {
     if (elementBusy) return;
     const selected = selectReferenceFiles(elementFiles, incoming,
       capabilities?.elements?.max_assets_per_element ?? 8, capabilities?.elements?.max_upload_mb ?? 15);
+    const roles = referenceRoles(elementType, selected.files, elementFileRoles);
+    setElementFileRoles(Object.fromEntries(selected.files.map((file, index) => [referenceFileKey(file), roles[index]])));
     setElementFiles(selected.files);
     setElementUploadError(selected.error);
   }
@@ -1235,7 +1213,7 @@ export default function Home() {
 
   function removeElementFromScene(element: CinemaElement) {
     if (isBusy) return;
-    const mentionPattern = new RegExp(`(^|\\s)@${escapeRegExp(element.handle)}\\b\\s*`, "gi");
+    const mentionPattern = new RegExp(`(^|[^A-Za-z0-9_])@${escapeRegExp(element.handle)}(?![A-Za-z0-9_-])\\s*`, "gi");
     setPrompt((current) => current.replace(mentionPattern, "$1").replace(/ {2,}/g, " ").trimStart());
     setElementApplyAll((current) => ({ ...current, [element.id]: false }));
     if (selectedElementId === element.id) setSelectedElementId(null);
@@ -1327,7 +1305,7 @@ export default function Home() {
     }
     setElementBusy(true);
     setElementUploadError("");
-    const roles = elementFiles.map((file, index) => elementFileRoles[referenceFileKey(file)] || suggestedElementRoles(elementType, elementFiles.length)[index]);
+    const roles = referenceRoles(elementType, elementFiles, elementFileRoles);
     const signature = JSON.stringify([elementName.trim(), elementHandle, elementType, elementDescription.trim(), roles, elementFiles.map(referenceFileKey)]);
     if (elementSaveRequest.current.signature !== signature) elementSaveRequest.current = { signature, id: crypto.randomUUID() };
     try {
@@ -1374,7 +1352,7 @@ export default function Home() {
       const updated = await addElementAssets(
         element.id,
         incoming,
-        suggestedElementRoles(element.type, incoming.length, element.assets.map((asset) => asset.role)),
+        referenceRoles(element.type, incoming, {}, element.assets.map((asset) => asset.role)),
         requestId
       );
       storeElement(updated);
@@ -2097,7 +2075,7 @@ export default function Home() {
             <div className="studio-stage-area">
               <div className={`studio-canvas ${(finalVideo?.aspectRatio || aspectRatio) === "9:16" ? "studio-canvas-portrait" : (finalVideo?.aspectRatio || aspectRatio) === "1:1" ? "studio-canvas-square" : "studio-canvas-landscape"}`}>
                 {studioVideoUrl ? (
-                  <video src={studioVideoUrl} controls playsInline preload="metadata" className="absolute inset-0 h-full w-full object-contain" />
+                  <StudioVideo src={studioVideoUrl} controls playsInline preload="metadata" className="absolute inset-0 h-full w-full object-contain" />
                 ) : studioPreviewAsset ? (
                   <Image unoptimized width={640} height={640} src={absoluteApiUrl(studioPreviewAsset.asset_url)} alt={studioPreviewElement?.name || "Element preview"} decoding="async" className="absolute inset-0 h-full w-full object-contain" />
                 ) : (
@@ -2158,7 +2136,6 @@ export default function Home() {
               </div>
 
               <div className="studio-prompt-editor-wrap">
-                <PromptHighlight text={prompt} elements={elements} />
                 <textarea
                   value={prompt}
                   onChange={(event) => updateMentionState(event.target.value)}
@@ -2332,7 +2309,7 @@ export default function Home() {
                         <input type="range" min="0.55" max="1" step="0.05" value={Math.min(1, elementStrengths[selectedElement.id] ?? 1)} onChange={(e) => setElementStrengths((current) => ({ ...current, [selectedElement.id]: Number(e.target.value) }))} className="studio-range" />
                         <span className="studio-range-value">{Math.min(1, elementStrengths[selectedElement.id] ?? 1).toFixed(2)}</span>
                       </label>
-                      <label className="studio-check-row"><input type="checkbox" checked={Boolean(elementApplyAll[selectedElement.id])} onChange={(e) => setElementApplyAll((current) => ({ ...current, [selectedElement.id]: e.target.checked }))} /><span>Keep this Element active across all Factory scenes</span></label>
+                      <label className="studio-check-row"><input type="checkbox" checked={appliesToAllScenes(selectedElement.type, elementApplyAll[selectedElement.id])} onChange={(e) => setElementApplyAll((current) => ({ ...current, [selectedElement.id]: e.target.checked }))} /><span>Keep this Element active across all Factory scenes</span></label>
                     </div>
 
                     {selectedElement.type === "character" && <div className="mt-3 rounded-xl border border-[var(--border)] bg-[var(--panel-subtle)] px-3 py-2 text-[10px] leading-5 text-[var(--text-muted)]">Creator lock uses the Character reference in both IC-LoRA stages. For best identity, use a clean face close-up first, then full-body and profile views. Keep <strong>Follow scene prompt</strong> when the video needs a different outfit from the reference photo.</div>}
@@ -2541,7 +2518,7 @@ export default function Home() {
               <div><div className="studio-inspector-eyebrow">New Element</div><h2 className="mt-1 text-lg font-semibold text-[var(--text)]">Create a reusable visual identity</h2><p className="mt-1 text-xs text-[var(--text-muted)]">Characters, props and locations are saved once, then reused in prompts with @mentions.</p></div>
               <button type="button" disabled={elementBusy} aria-label="Close Element creator" onClick={() => setShowElementCreator(false)} className="studio-icon-button">×</button>
             </div>
-            <fieldset disabled={elementBusy} className="studio-modal-body min-w-0">
+            <div className="studio-modal-body"><fieldset disabled={elementBusy} className="studio-modal-fields">
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
                 {(["character", "prop", "location", "style"] as ElementType[]).map((type) => <button key={type} type="button" onClick={() => { setElementType(type); setElementFileRoles({}); }} className={`studio-element-type-choice ${elementType === type ? "studio-element-type-choice-active" : ""}`}><span className={elementTone(type)}>{type}</span></button>)}
               </div>
@@ -2550,29 +2527,31 @@ export default function Home() {
                 <label className="studio-field-label">Prompt handle<div className="studio-handle-field mt-1"><span aria-hidden="true">@</span><input className="studio-inspector-control studio-handle-input" maxLength={32} autoComplete="off" spellCheck={false} value={elementHandle} onChange={(e) => setElementHandle(e.target.value.replace(/^@/, "").replace(/[^A-Za-z0-9_-]/g, ""))} placeholder="Radha" /></div></label>
               </div>
               <label className="mt-3 block studio-field-label">Identity / design description<textarea rows={3} maxLength={1600} value={elementDescription} onChange={(e) => setElementDescription(e.target.value)} className="studio-inspector-textarea mt-1" placeholder="Face, costume, materials, landmarks or other traits that must remain stable." /></label>
-              <label className="studio-upload-dropzone" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); selectElementFiles(Array.from(event.dataTransfer.files)); }}>
+              <label className={`studio-upload-dropzone ${elementFiles.length ? "studio-upload-dropzone-compact" : ""}`} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); selectElementFiles(Array.from(event.dataTransfer.files)); }}>
                 <span className="studio-upload-icon">+</span>
-                <strong>Drop reference images or click to upload</strong>
-                <small>{elementType === "character" ? "Best order: 1 face close-up · 2 full body · 3 profile · 4 costume. Triven tags these automatically." : `PNG, JPEG or WEBP · up to ${capabilities?.elements?.max_assets_per_element ?? 8} references`}</small>
+                <strong>{elementFiles.length ? "Add more references" : "Drop reference images or click to upload"}</strong>
+                <small>{elementType === "character" ? "Use clear face, full-body, profile and costume views of the same person. Check the suggested labels below." : `PNG, JPEG or WEBP · up to ${capabilities?.elements?.max_assets_per_element ?? 8} references`}</small>
                 <small>PNG, JPEG or WEBP · at least 128 × 128 · up to {capabilities?.elements?.max_upload_mb ?? 15} MB each · {capabilities?.elements?.max_assets_per_element ?? 8} images maximum</small>
                 <input aria-label="Upload reference images" type="file" multiple accept="image/png,image/jpeg,image/webp,.jpg,.jpeg,.png,.webp" className="sr-only" onChange={(e) => { selectElementFiles(Array.from(e.target.files || [])); e.target.value = ""; }} />
               </label>
-              {elementFiles.length > 0 && <div className="studio-reference-uploads">{elementFiles.map((file, index) => {
+              {elementFiles.length > 0 && <div className="studio-upload-selection"><p className="studio-upload-selection-heading">{elementFiles.length} references selected <span>Check each image’s role</span></p><div className="studio-reference-uploads">{elementFiles.map((file, index) => {
                 const key = referenceFileKey(file);
-                const role = elementFileRoles[key] || suggestedElementRoles(elementType, elementFiles.length)[index];
+                const role = referenceRoles(elementType, elementFiles, elementFileRoles)[index];
                 return <div key={key} className="studio-reference-upload">
                   <ReferenceUploadPreview file={file} />
-                  <div className="min-w-0 flex-1"><p className="truncate text-xs" title={file.name}>{file.name}</p><label className="text-xs text-[var(--text-muted)]">Reference role<select value={role} onChange={(event) => setElementFileRoles((current) => ({ ...current, [key]: event.target.value as ElementAssetRole }))} className="studio-inspector-control mt-1" aria-label={`Reference role for ${file.name}`}>
+                  <div className="min-w-0 flex-1"><p className="truncate text-xs" title={file.name}>{file.name}</p><label className="text-xs text-[var(--text-muted)]"><span className="sr-only">Reference role</span><select value={role} onChange={(event) => setElementFileRoles((current) => ({ ...current, [key]: event.target.value as ElementAssetRole }))} className="studio-inspector-control mt-1" aria-label={`Reference role for ${file.name}`}>
                     {(elementType === "character" ? ["face", "full_body", "profile", "costume", "support"] : [elementType === "prop" ? "object" : elementType, "support"]).map((value) => <option key={value} value={value}>{elementRoleLabel(value as ElementAssetRole)}</option>)}
                   </select></label></div>
                   <button type="button" className="studio-icon-button" aria-label={`Remove ${file.name}`} onClick={() => { setElementFiles((current) => current.filter((item) => item !== file)); setElementUploadError(""); }}>×</button>
                 </div>;
-              })}</div>}
-            </fieldset>
-            {elementUploadError && <p role="alert" className="studio-upload-error">{elementUploadError}</p>}
-            <div className="studio-modal-footer">
+              })}</div></div>}
+            </fieldset></div>
+            <div className="studio-modal-actions">
+              {elementUploadError && <p role="alert" className="studio-upload-error">{elementUploadError}</p>}
+              <div className="studio-modal-footer">
               <button type="button" disabled={elementBusy} onClick={() => setShowElementCreator(false)} className="studio-secondary-button">Cancel</button>
               <button type="button" onClick={() => void handleCreateElement()} disabled={elementBusy} className="studio-primary-button">{elementBusy ? "Saving..." : `Save @${elementHandle || "Element"}`}</button>
+              </div>
             </div>
           </div>
         </div>
@@ -2586,8 +2565,8 @@ export default function Home() {
           {jobError && <p role="alert" className="mt-2 text-xs text-[var(--danger-text)]">{jobError}</p>}
           <div className="mt-2 space-y-2">{serverJobs.filter((job) => (job.chat_id || job.payload.chat_id) === activeChatId).slice(0, 20).map((job) => <div key={job.job_id} className="flex flex-wrap items-center justify-between gap-2 border-t border-[var(--border)] py-2 text-xs"><div><strong className="capitalize">{job.job_type} · {job.status}</strong><p className="text-[var(--text-muted)]">{job.error || job.message}</p></div>{job.status !== "failed" && <button type="button" disabled={isBusy} onClick={() => recoverServerJob(job)} className="studio-secondary-button">{job.status === "completed" ? "Open result" : "Resume tracking"}</button>}</div>)}</div>
         </section>}
-        {recoveredAssets.length > 0 && <details className="mt-4 rounded-2xl border border-[var(--border)] p-4"><summary className="cursor-pointer text-sm font-semibold">Saved render assets ({recoveredAssets.length})</summary><p className="mt-2 text-xs text-[var(--text-muted)]">These outputs remain available even if a later step fails.</p><div className="mt-3 grid gap-3 sm:grid-cols-2">{recoveredAssets.filter((asset) => asset.filename.endsWith(".mp4")).map((asset) => <div key={asset.filename} className="min-w-0 rounded-xl border border-[var(--border)] p-3"><video controls preload="metadata" src={asset.video_url || `/media/generated/${encodeURIComponent(asset.filename)}`} className="w-full" /><div className="mt-2 flex flex-wrap gap-2 text-xs"><span>Visual QC</span><QCStatusPill status={asset.visual_qc_status || asset.metadata?.visual_qc_status || "not_checked"} /><span>Audio QC</span><QCStatusPill status={asset.audio_qc_status || asset.metadata?.audio_qc_status || "not_checked"} /></div><a className="mt-2 inline-block text-xs underline" href={asset.download_url || `/api/v1/generations/download/${encodeURIComponent(asset.filename)}`}>Download retained clip</a></div>)}</div></details>}
-        {videoTakes.length > 0 && <details className="mt-4 rounded-2xl border border-[var(--border)] bg-[var(--panel-bg)] p-4"><summary className="cursor-pointer text-sm font-semibold">Saved takes ({videoTakes.length})</summary><p className="mt-2 text-xs text-[var(--text-muted)]">Every successful take is kept when you change settings or retry.</p><div className="mt-3 space-y-2">{videoTakes.map((take, index) => <div key={take.filename} className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[var(--border)] p-3"><div className="min-w-0"><p className="text-xs">Take {videoTakes.length - index} · {take.label}</p><div className="mt-1 flex flex-wrap gap-2"><span className="text-xs">Visual</span><QCStatusPill status={take.qcReport?.visual || "unknown"} /><span className="text-xs">Audio</span><QCStatusPill status={take.qcReport?.audio || "unknown"} /></div></div><div className="flex gap-2"><button type="button" disabled={isBusy} onClick={() => { setFinalVideo(take); setFactoryResult(take.factoryResult || null); }} className="studio-secondary-button">Watch & inspect</button><a href={take.downloadUrl} className="studio-secondary-button">Download</a></div></div>)}</div></details>}
+        {recoveredAssets.length > 0 && <details className="mt-4 rounded-2xl border border-[var(--border)] p-4"><summary className="cursor-pointer text-sm font-semibold">Saved render assets ({recoveredAssets.length})</summary><p className="mt-2 text-xs text-[var(--text-muted)]">These outputs remain available even if a later step fails.</p><div className="mt-3 grid gap-3 sm:grid-cols-2">{recoveredAssets.filter((asset) => asset.filename.endsWith(".mp4")).map((asset) => <div key={asset.filename} className="min-w-0 rounded-xl border border-[var(--border)] p-3"><StudioVideo controls preload="metadata" src={asset.video_url || `/media/generated/${encodeURIComponent(asset.filename)}`} className="w-full" /><div className="mt-2 flex flex-wrap gap-2 text-xs"><span>Visual QC</span><QCStatusPill status={asset.visual_qc_status || asset.metadata?.visual_qc_status || "not_checked"} /><span>Audio QC</span><QCStatusPill status={asset.audio_qc_status || asset.metadata?.audio_qc_status || "not_checked"} /></div><a className="mt-2 inline-block text-xs underline" href={asset.download_url || `/api/v1/generations/download/${encodeURIComponent(asset.filename)}`}>Download retained clip</a></div>)}</div></details>}
+        {videoTakes.length > 0 && <details className="mt-4 rounded-2xl border border-[var(--border)] bg-[var(--panel-bg)] p-4"><summary className="cursor-pointer text-sm font-semibold">Saved takes ({videoTakes.length})</summary><p className="mt-2 text-xs text-[var(--text-muted)]">Every successful take is kept when you change settings or retry.</p><div className="mt-3 space-y-2">{videoTakes.map((take, index) => <div key={take.filename} className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[var(--border)] p-3"><div className="min-w-0"><p className="text-xs">Take {videoTakes.length - index} · {take.label}</p><div className="mt-1 flex flex-wrap gap-2"><span className="text-xs">Visual</span><QCStatusPill status={take.qcReport?.visual || "unknown"} /><span className="text-xs">Audio</span><QCStatusPill status={take.qcReport?.audio || "unknown"} /></div></div><div className="flex gap-2"><button type="button" disabled={isBusy} onClick={() => { studioPlayback.pauseAll(); setFinalVideo(take); setFactoryResult(take.factoryResult || null); }} className="studio-secondary-button">Watch & inspect</button><a href={take.downloadUrl} className="studio-secondary-button">Download</a></div></div>)}</div></details>}
 
         {finalVideo && (
           <section className="mt-5">
@@ -2596,7 +2575,7 @@ export default function Home() {
           </section>
         )}
 
-        {!!factoryResult?.scene_results?.length && <details className="mt-5 rounded-2xl border border-[var(--border)] bg-[var(--panel-bg)] p-4"><summary className="cursor-pointer text-sm font-semibold">Inspect individual scenes ({factoryResult.scene_results.length})</summary><div className="mt-4 grid gap-4 lg:grid-cols-2">{factoryResult.scene_results.map((scene) => <article key={scene.filename} className="overflow-hidden rounded-xl border border-[var(--border)]"><video src={scene.video_url} controls preload="metadata" className="w-full" /><div className="p-3"><h3 className="text-sm font-semibold">Scene {scene.scene_index + 1}</h3><div className="mt-2 flex flex-wrap items-center gap-2 text-xs"><span>Visual / identity QC</span><QCStatusPill status={scene.visual_qc_status || "not_checked"} /><span>Speech / audio QC</span><QCStatusPill status={scene.audio_qc_status || "not_checked"} /></div>{[scene.visual_qc, scene.audio_qc].flatMap(qcReasons).map((reason, index) => <p key={index} className="mt-2 text-xs">{reason}</p>)}<a href={scene.download_url} className="mt-3 inline-block text-xs underline">Download scene</a></div></article>)}</div></details>}
+        {!!factoryResult?.scene_results?.length && <details className="mt-5 rounded-2xl border border-[var(--border)] bg-[var(--panel-bg)] p-4"><summary className="cursor-pointer text-sm font-semibold">Inspect individual scenes ({factoryResult.scene_results.length})</summary><div className="mt-4 grid gap-4 lg:grid-cols-2">{factoryResult.scene_results.map((scene) => <article key={scene.filename} className="overflow-hidden rounded-xl border border-[var(--border)]"><StudioVideo src={scene.video_url} controls preload="metadata" className="w-full" /><div className="p-3"><h3 className="text-sm font-semibold">Scene {scene.scene_index + 1}</h3><div className="mt-2 flex flex-wrap items-center gap-2 text-xs"><span>Visual / identity QC</span><QCStatusPill status={scene.visual_qc_status || "not_checked"} /><span>Speech / audio QC</span><QCStatusPill status={scene.audio_qc_status || "not_checked"} /></div>{[scene.visual_qc, scene.audio_qc].flatMap(qcReasons).map((reason, index) => <p key={index} className="mt-2 text-xs">{reason}</p>)}<a href={scene.download_url} className="mt-3 inline-block text-xs underline">Download scene</a></div></article>)}</div></details>}
 
         {factoryResult && (
           <section className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-7">
@@ -2634,7 +2613,7 @@ export default function Home() {
                 return (
                   <article key={scene.id} className="overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--panel-bg)]">
                     {video ? (
-                      <div className="bg-black"><video src={video.url} controls playsInline className={`w-full object-contain ${aspectClass(result.aspect_ratio)}`} /></div>
+                      <div className="bg-black"><StudioVideo src={video.url} controls playsInline className={`w-full object-contain ${aspectClass(result.aspect_ratio)}`} /></div>
                     ) : (
                       <div className={`relative flex items-center justify-center bg-[var(--empty-bg)] ${aspectClass(result.aspect_ratio)}`}><div className="text-center text-[var(--text-muted)]">{isGenerating ? <Spinner /> : <PlayIcon />}<div className="mt-3 text-xs">{isGenerating ? "Rendering with LTX..." : "Not rendered"}</div></div></div>
                     )}
@@ -2798,7 +2777,7 @@ function FinalVideoCard({ video, aspectRatio }: { video: NonNullable<FinalVideo>
           <a href={video.downloadUrl} className="flex h-10 items-center justify-center gap-2 rounded-xl bg-[var(--primary-bg)] px-4 text-xs font-medium text-[var(--primary-fg)] hover:bg-[var(--primary-hover)]"><DownloadIcon /> Download MP4</a>
         </div>
       </div>
-      <div className={`mx-auto bg-black ${aspectRatio === "9:16" ? "max-w-[430px]" : aspectRatio === "1:1" ? "max-w-[760px]" : "w-full"}`}><video src={video.url} controls playsInline className={`w-full object-contain ${aspectClass(aspectRatio)}`} /></div>
+      <div className={`mx-auto bg-black ${aspectRatio === "9:16" ? "max-w-[430px]" : aspectRatio === "1:1" ? "max-w-[760px]" : "w-full"}`}><StudioVideo src={video.url} controls playsInline className={`w-full object-contain ${aspectClass(aspectRatio)}`} /></div>
       <VideoQCPanel report={video.qcReport} />
       <div className="border-t border-[var(--border)] px-5 py-4 text-[11px] leading-5 text-[var(--text-muted)] sm:px-6">{video.qualityNote}</div>
     </div>

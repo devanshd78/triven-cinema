@@ -91,7 +91,13 @@ class ElementUploadRecoveryTests(unittest.TestCase):
         with Image.open(path) as normalized:
             self.assertEqual(normalized.size, (256, 320))
             self.assertNotIn(274, normalized.getexif())
-        self.assertEqual(mime, 'image/png')
+        self.assertEqual(mime, 'image/jpeg')
+
+    def test_large_phone_photo_has_bounded_working_dimensions(self):
+        saved = self.create([upload(size=(5000, 1280))])
+        asset = saved['assets'][0]
+        self.assertEqual(asset['width'], 4096)
+        self.assertLess(asset['height'], 1280)
 
     def test_face_reference_becomes_canonical_regardless_of_upload_order(self):
         saved = self.create([upload('body.png', role='full_body'), upload('face.png', role='face')])
@@ -125,6 +131,15 @@ class ElementUploadRecoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(service.ElementError, '@Missing'):
             service.validate_prompt_bindings('@Missing walks through the scene.', [])
         service.validate_prompt_bindings('Send to contact@example.com', [])
+
+    def test_prompt_compile_does_not_replace_another_characters_handle_prefix(self):
+        element = self.create()
+        bindings = service.resolve_element_bindings(self.workspace, [ElementBinding(element_id=element['id'], handle='Actor')])
+        compiled = service.compile_element_prompt('@Actor-Jane stands next to @Actor.', bindings)
+        self.assertIn('@Actor-Jane', compiled)
+        self.assertIn('next to Actor.', compiled)
+        renamed = bindings[0].model_copy(update={'handle': 'Actor-'})
+        self.assertIn('Actor waves.', service.compile_element_prompt('@Actor- waves.', [renamed]))
 
     def test_actual_multipart_save_retry_and_image_download(self):
         app = FastAPI()

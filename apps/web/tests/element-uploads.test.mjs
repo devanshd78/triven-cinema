@@ -20,3 +20,15 @@ test('reference count is bounded before upload', () => {
   assert.equal(next.files.length, 2);
   assert.match(next.error, /at most 2/);
 });
+
+test('filenames identify face, profile, body and costume regardless of selection order', async () => {
+  const { referenceRoles, referenceFileKey } = await import('../src/lib/element-uploads.ts');
+  const images = ['side profile.jpeg', 'full body.jpeg', 'face.jpeg', 'costume.jpeg'].map((name) => file(name));
+  assert.deepEqual(referenceRoles('character', images), ['profile', 'full_body', 'face', 'costume']);
+  assert.deepEqual(referenceRoles('character', images, { [referenceFileKey(images[0])]: 'face' }), ['face', 'full_body', 'face', 'costume']);
+});
+test('unnamed references fill the roles not already identified by a filename', async () => {
+  const { referenceRoles } = await import('../src/lib/element-uploads.ts');
+  assert.deepEqual(referenceRoles('character', [file('photo001.jpg'), file('face.jpg')]), ['full_body', 'face']);
+  assert.deepEqual(referenceRoles('prop', [file('face.png')]), ['object']);
+});
