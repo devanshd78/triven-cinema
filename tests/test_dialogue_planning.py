@@ -7,6 +7,12 @@ from app.services.scene_planner import create_prompt_only_plan, create_scene_pla
 
 
 class DialoguePlanningTests(unittest.TestCase):
+    def test_hindi_sentences_split_without_dropping_or_repeating_words(self):
+        script = "पहले स्क्रीन की बात करते हैं। अब कैमरे की तरफ आते हैं।"
+        scenes = split_spoken_script(script, 2)
+        self.assertEqual(scenes, ["पहले स्क्रीन की बात करते हैं।", "अब कैमरे की तरफ आते हैं।"])
+        self.assertEqual(" ".join(scenes), script)
+
     def test_short_legacy_utterance_is_not_repeated_to_fill_scenes(self):
         plan = create_prompt_only_plan('@char1 says "Welcome to our studio."', 4, target_scene_duration_seconds=15)
         self.assertEqual([s.spoken_script for s in plan.scenes], ["Welcome to our studio.", "", "", ""])

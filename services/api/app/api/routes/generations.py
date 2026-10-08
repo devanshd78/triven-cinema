@@ -57,7 +57,7 @@ from app.services.job_service import (
 from app.services.job_request_service import submit_generation_request
 from app.services.long_render_service import render_long_clip
 from app.services.dialogue_service import build_audio_prompt, separate_visual_and_script
-from app.services.render_review_service import aggregate_qc, pass_flag, qc_report, register_render, review_audio
+from app.services.render_review_service import aggregate_qc, pass_flag, qc_report, recover_before_refinement, register_render, review_audio
 from app.services.media_probe import probe_media
 from app.services.metrics_service import (
     estimate_gpu_cost,
@@ -302,17 +302,19 @@ def _generate_video_impl(
         total_chunks += int(result.chunk_count or 1)
 
         qc = None
+        def inspect_visual(path: Path):
+            return evaluate_scene_cardinality(
+                path, entity_locks=enhanced_entity_locks,
+                visible_entity_counts=enhanced_visible_counts,
+                character_bible=enhanced_character_bible, scene_prompt=prompt_to_render,
+                qc_mode=request.continuity_qc_mode, reference_frame_path=reference_path,
+                canonical_reference_paths=element_canonical_reference_paths(active_elements),
+            )
         if request.continuity_qc_mode != "off":
             if progress:
                 progress("rendering", 78, "Inspecting visual identity and artifacts...")
             try:
-                qc = evaluate_scene_cardinality(
-                    candidate_path, entity_locks=enhanced_entity_locks,
-                    visible_entity_counts=enhanced_visible_counts,
-                    character_bible=enhanced_character_bible, scene_prompt=prompt_to_render,
-                    qc_mode=request.continuity_qc_mode, reference_frame_path=reference_path,
-                    canonical_reference_paths=element_canonical_reference_paths(active_elements),
-                )
+                qc = inspect_visual(candidate_path)
             except Exception as exc:
                 qc = ContinuityQCResult(skipped=True, note=f"Visual QC unavailable ({type(exc).__name__}).")
         visual_report = qc_report(qc)
@@ -321,6 +323,16 @@ def _generate_video_impl(
         register_render(workspace_id, source_path, kind="scene", scene_index=request.scene_index or 0,
                         visual_qc_status=visual_report["status"], visual_qc=visual_report,
                         visual_qc_attempts=scene_attempts)
+        result, qc, base_review = recover_before_refinement(
+            result, qc, inspect=inspect_visual, workspace_id=workspace_id, scene_index=request.scene_index or 0,
+            progress=(lambda message: progress("rendering", 78, message)) if progress else None,
+        )
+        if base_review:
+            scene_attempts.append({"attempt": attempt + 1, **base_review})
+            if base_review["selected"]:
+                source_path = Path(result.path)
+                visual_report = qc_report(qc)
+                continuity_warnings.append("Texture refinement failed visual QC; the original take passed and was selected without another GPU render.")
         checkpoint_job_result({"filename": source_path.name, "video_url": media_url(source_path.name),
                                "download_url": download_url(source_path.name),
                                "visual_qc_status": visual_report["status"], "visual_qc": visual_report})

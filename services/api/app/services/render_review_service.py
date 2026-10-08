@@ -1,11 +1,12 @@
 """Post-render checks never revoke access to a completed render."""
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
 from app.core.config import settings
 from app.services.audio_qc import AudioQCResult, evaluate_scene_audio
+from app.services.continuity_qc import ContinuityQCResult
 from app.services.dialogue_service import build_audio_prompt
 from app.services.job_service import register_generated_asset
 
@@ -38,6 +39,36 @@ def pass_flag(status: str) -> bool | None:
 def register_render(workspace_id: str | None, path: Path, **metadata) -> None:
     if workspace_id:
         register_generated_asset(workspace_id, path.name, metadata=metadata)
+
+
+def recover_before_refinement(result, qc, *, inspect: Callable[[Path], ContinuityQCResult],
+                              workspace_id: str | None, scene_index: int,
+                              progress: Callable[[str], None] | None = None) -> tuple:
+    """Use the existing base only if independent QC passes it after refinement fails."""
+    base_path = getattr(result, "base_path", None)
+    if not base_path or not getattr(result, "detail_refined", False) or qc_report(qc)["status"] != "failed":
+        return result, qc, None
+    base = Path(base_path)
+    if not base.is_file() or not base.stat().st_size:
+        return result, qc, None
+    if progress:
+        progress("Checking the saved original take before spending time on another render...")
+    try:
+        base_qc = inspect(base)
+    except Exception as exc:
+        base_qc = ContinuityQCResult(passed=False, skipped=True, note=f"Base visual QC unavailable ({type(exc).__name__}).")
+    report = qc_report(base_qc)
+    selected = report["status"] == "passed"
+    register_render(workspace_id, base, kind="scene", scene_index=scene_index,
+                    variant="before_detail_refinement", visual_qc_status=report["status"], visual_qc=report,
+                    refined_filename=result.filename)
+    attempt = {"filename": base.name, "variant": "before_detail_refinement", "selected": selected, **report}
+    if not selected:
+        return result, qc, attempt
+    # Keep all paid timing/cost data; choosing the base cannot refund GPU work.
+    restored = replace(result, path=str(base), filename=base.name, base_path=None, detail_refined=False,
+                       render_details=result.render_details + " · Base take selected: refinement failed visual QC")
+    return restored, base_qc, attempt
 
 
 @dataclass

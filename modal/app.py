@@ -269,8 +269,6 @@ def generate_video(
             element_sheet_path.unlink(missing_ok=True)
         if element_reference_video_path is not None:
             element_reference_video_path.unlink(missing_ok=True)
-        if apply_detail_refiner and output_path != base_output_path and output_path.exists() and output_path.stat().st_size:
-            base_output_path.unlink(missing_ok=True)
         if refined_picture_path is not None:
             refined_picture_path.unlink(missing_ok=True)
 
@@ -278,11 +276,18 @@ def generate_video(
         raise RuntimeError("LTX finished without producing an MP4 file.")
 
     elapsed = time.perf_counter() - started
+    # Keep the pre-refinement take for visual QC. A texture pass can succeed
+    # technically while degrading the face or adding artifacts; reviewing the
+    # existing base is much cheaper than regenerating the whole scene.
+    base_video_bytes = base_output_path.read_bytes() if detail_refined and base_output_path != output_path else None
     video_bytes = output_path.read_bytes()
     output_path.unlink(missing_ok=True)
+    if base_output_path != output_path:
+        base_output_path.unlink(missing_ok=True)
 
     return {
         "video_bytes": video_bytes,
+        "base_video_bytes": base_video_bytes,
         "seed": seed,
         "prompt": prompt,
         "render_details": (

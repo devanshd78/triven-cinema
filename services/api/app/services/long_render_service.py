@@ -21,6 +21,12 @@ def _register_render(result: VideoGenerationResult, *, part: int | None = None) 
         "continuation_part": part, "provider": result.provider,
         "timings_seconds": getattr(result, "timings_seconds", {}),
     })
+    base_path = getattr(result, "base_path", None)
+    if base_path:
+        register_current_generated_asset(Path(base_path).name, metadata={
+            "render_state": "generated", "visual_qc_status": "not_checked", "audio_qc_status": "not_checked",
+            "variant": "before_detail_refinement", "refined_filename": result.filename,
+        })
 
 
 def split_duration(duration_seconds: float, max_chunk_seconds: float | None = None) -> list[float]:

@@ -40,6 +40,27 @@ class InferencePreflightTests(unittest.TestCase):
         self.assertEqual(lookup.call_count, 1)
         self.assertEqual(lookup.call_args.args[1], "preflight")
 
+    def test_provider_saves_base_and_refined_video_separately(self):
+        endpoint = Mock()
+        endpoint.remote.return_value = {"video_bytes": b"refined", "base_video_bytes": b"base", "detail_refined": True}
+        with tempfile.TemporaryDirectory() as tmp, patch("inference.providers.modal_ltx.GENERATED_DIR", Path(tmp)), \
+             patch.object(ModalLTXProvider, "preflight", return_value={"ready": True}), \
+             patch("inference.providers.modal_ltx.modal.Function.from_name", return_value=endpoint):
+            result = ModalLTXProvider().generate("presenter", 512, 512, 5, 42, "conv")
+            self.assertEqual(Path(result.path).read_bytes(), b"refined")
+            self.assertEqual(Path(result.base_path).read_bytes(), b"base")
+            self.assertNotEqual(result.path, result.base_path)
+
+    def test_optional_base_save_failure_does_not_lose_main_video(self):
+        endpoint = Mock()
+        endpoint.remote.return_value = {"video_bytes": b"refined", "base_video_bytes": b"base", "detail_refined": True}
+        with patch.object(ModalLTXProvider, "preflight", return_value={"ready": True}), \
+             patch.object(ModalLTXProvider, "_write_video", side_effect=[Path("/tmp/refined.mp4"), OSError("Disk full")]), \
+             patch("inference.providers.modal_ltx.modal.Function.from_name", return_value=endpoint):
+            result = ModalLTXProvider().generate("presenter", 512, 512, 5, 42, "conv")
+        self.assertEqual(result.filename, "refined.mp4")
+        self.assertIsNone(result.base_path)
+
     def test_old_worker_is_rejected_before_gpu_rpc(self):
         endpoint = Mock()
         endpoint.remote.return_value = {"protocol_version": 1, "ready": True}

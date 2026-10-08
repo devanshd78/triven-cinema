@@ -145,6 +145,12 @@ class ModalLTXProvider(VideoProvider):
         if not video_bytes:
             raise RuntimeError("Modal returned no video bytes.")
         destination = self._write_video(video_bytes, "ltx-modal")
+        base_destination = None
+        if result.get("base_video_bytes"):
+            try:
+                base_destination = self._write_video(result["base_video_bytes"], "ltx-base")
+            except OSError:
+                LOGGER.warning("Could not save pre-refinement alternative; the completed render is preserved.")
 
         wall_elapsed = time.perf_counter() - started
         elapsed = float(result.get("render_seconds") or 0.0) or wall_elapsed
@@ -168,6 +174,7 @@ class ModalLTXProvider(VideoProvider):
             realism_profile=str(result.get("realism_profile") or realism_profile),
             detail_refined=bool(result.get("detail_refined", False)),
             timings_seconds=timings_seconds,
+            base_path=str(base_destination) if base_destination else None,
         )
 
     def retake_audio(

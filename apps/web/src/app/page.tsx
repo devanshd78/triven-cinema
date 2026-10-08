@@ -2312,7 +2312,7 @@ export default function Home() {
                       <label className="studio-check-row"><input type="checkbox" checked={appliesToAllScenes(selectedElement.type, elementApplyAll[selectedElement.id])} onChange={(e) => setElementApplyAll((current) => ({ ...current, [selectedElement.id]: e.target.checked }))} /><span>Keep this Element active across all Factory scenes</span></label>
                     </div>
 
-                    {selectedElement.type === "character" && <div className="mt-3 rounded-xl border border-[var(--border)] bg-[var(--panel-subtle)] px-3 py-2 text-[10px] leading-5 text-[var(--text-muted)]">Creator lock uses the Character reference in both IC-LoRA stages. For best identity, use a clean face close-up first, then full-body and profile views. Keep <strong>Follow scene prompt</strong> when the video needs a different outfit from the reference photo.</div>}
+                    {selectedElement.type === "character" && <div className="mt-3 rounded-xl border border-[var(--border)] bg-[var(--panel-subtle)] px-3 py-2 text-[10px] leading-5 text-[var(--text-muted)]">Use a clear portrait showing only this person. <strong>Follow scene prompt</strong> uses the face reference; describe the outfit in your scene. <strong>Lock reference outfit</strong> uses the selected primary photo for both appearance and clothing. Each character uses one portrait in generation to avoid a photo collage.</div>}
 
                     <div className="mt-3 flex gap-2 overflow-x-auto pb-1">
                       {selectedElement.assets.map((reference) => (
@@ -2360,7 +2360,7 @@ export default function Home() {
                   ) : mode === "storyboard" ? (
                     <Control label="Storyboard scenes"><select className="studio-inspector-control" value={sceneCount} onChange={(e) => setSceneCount(Number(e.target.value))}>{[2,3,4,6,8,10,12,16,20].map((value) => <option key={value} value={value}>{value} scenes</option>)}</select></Control>
                   ) : null}
-                    <label className="studio-field-label">Spoken dialogue<textarea value={spokenScript} onChange={(e) => setSpokenScript(e.target.value)} rows={5} className="studio-inspector-textarea" placeholder="Exact words the character should say. Leave empty for no scripted dialogue." /></label>
+                    <label className="studio-field-label">Spoken dialogue<textarea value={spokenScript} onChange={(e) => setSpokenScript(e.target.value)} rows={5} className="studio-inspector-textarea" placeholder="Paste the exact spoken words here, including Hindi. Keep scene and camera instructions in the visual prompt. Leave empty for no dialogue." /></label>
                   <Control label="Audio"><select className="studio-inspector-control" value={audioMode} onChange={(e) => setAudioMode(e.target.value as AudioMode)}><option value="mastered">Generated + mastered</option><option value="native">Native LTX audio</option><option value="mute">Mute final video</option></select></Control>
                   <Control label="Continuity"><select className="studio-inspector-control" value={continuityMode} onChange={(e) => { setContinuityMode(e.target.value as ContinuityMode); invalidateRenderedMedia(); }}><option value="strict">Strict · identity + image</option><option value="balanced">Balanced · identity</option><option value="off">Off</option></select></Control>
                   <Control label="Realism"><select className="studio-inspector-control" value={realismProfile} onChange={(e) => { setRealismProfile(e.target.value as RealismProfile); invalidateRenderedMedia(); }}><option value="real_skin">Real Skin · recommended</option><option value="identity_max">Identity Max · use Character Element</option><option value="standard">Standard · faster</option></select></Control>
@@ -2530,7 +2530,7 @@ export default function Home() {
               <label className={`studio-upload-dropzone ${elementFiles.length ? "studio-upload-dropzone-compact" : ""}`} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); selectElementFiles(Array.from(event.dataTransfer.files)); }}>
                 <span className="studio-upload-icon">+</span>
                 <strong>{elementFiles.length ? "Add more references" : "Drop reference images or click to upload"}</strong>
-                <small>{elementType === "character" ? "Use clear face, full-body, profile and costume views of the same person. Check the suggested labels below." : `PNG, JPEG or WEBP · up to ${capabilities?.elements?.max_assets_per_element ?? 8} references`}</small>
+                <small>{elementType === "character" ? "Start with a clear face photo showing one person. Avoid group photos and collages. Additional views stay saved; check their labels below." : `PNG, JPEG or WEBP · up to ${capabilities?.elements?.max_assets_per_element ?? 8} references`}</small>
                 <small>PNG, JPEG or WEBP · at least 128 × 128 · up to {capabilities?.elements?.max_upload_mb ?? 15} MB each · {capabilities?.elements?.max_assets_per_element ?? 8} images maximum</small>
                 <input aria-label="Upload reference images" type="file" multiple accept="image/png,image/jpeg,image/webp,.jpg,.jpeg,.png,.webp" className="sr-only" onChange={(e) => { selectElementFiles(Array.from(e.target.files || [])); e.target.value = ""; }} />
               </label>

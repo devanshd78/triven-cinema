@@ -20,6 +20,7 @@ class VideoGenerationResult:
     realism_profile: str = "standard"
     detail_refined: bool = False
     timings_seconds: dict[str, float] = field(default_factory=dict)
+    base_path: str | None = None
 
 
 class VideoProvider(ABC):

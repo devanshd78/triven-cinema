@@ -150,6 +150,7 @@ QC RULES:
 - Otherwise, if a previous approved reference exists, recurring named characters should preserve the same wardrobe state unless the scene explicitly calls for a justified change.
 - A face replacement, unexplained body redesign, one named character turning into another, or strong identity drift is a failure.
 - Artifact failure examples: facial melting, eye/teeth deformation, extra/fused fingers or limbs, warped hands, clothing seams/patterns morphing, random straps/buttons/zippers, object duplication, floating geometry, unstable desk/microphone/set geometry, or unrequested glyph/text noise.
+- Reject a reference photograph displayed as a floating panel, slideshow, inset, or poster in place of the requested physical subject. Reject unrequested scratched-glass/film-damage overlays, persistent veiling glare obscuring the subject, and reference backgrounds replacing the requested setting. Judge these only in GENERATED CLIP SAMPLE images and allow effects explicitly requested by the scene.
 - Inspect the EARLIEST generated sample especially carefully. A bad first seconds phase, frozen reference hold, identity redesign, or abrupt wardrobe mutation is a failure even if later samples recover.
 - Ignore tiny unrelated background strangers unless they duplicate a locked recurring subject.
 - Be conservative about ordinary motion blur, pose changes, expression changes, lighting, and camera perspective. Only flag meaningful identity or artifact failures.

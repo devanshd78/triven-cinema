@@ -52,7 +52,7 @@ def split_spoken_script(script: str, scene_count: int) -> list[str]:
         return [""] * count
     if count == 1:
         return [text]
-    sentences = [item.strip() for item in re.split(r'(?<=[.!?。！？])\s+|\n+', text) if item.strip()]
+    sentences = [item.strip() for item in re.split(r'(?<=[.!?。！？।॥])\s+|\n+', text) if item.strip()]
     # Keep short utterances intact. A long unpunctuated narration can be divided
     # at whitespace without dropping or rewriting any source words.
     if len(sentences) == 1 and len(text.split()) > 40:

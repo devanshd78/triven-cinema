@@ -121,7 +121,7 @@ class ElementServiceTests(unittest.TestCase):
         self.assertIn("Animate forward", compiled)
         self.assertIn("Generated video:", compiled)
 
-    def test_reference_sheet_uses_supporting_views_not_only_primary(self):
+    def test_reference_wardrobe_uses_one_selected_portrait_without_a_collage(self):
         radha = create_element(
             self.workspace,
             name="Radha",
@@ -151,8 +151,57 @@ class ElementServiceTests(unittest.TestCase):
             with Image.open(path).convert("RGB") as image:
                 colors = {color for _, color in (image.getcolors(maxcolors=image.width * image.height) or [])}
                 self.assertIn((255, 0, 0), colors)
-                self.assertIn((0, 255, 0), colors)
+                self.assertNotIn((0, 255, 0), colors)
+                self.assertNotIn((0, 0, 255), colors)
+
+    def test_face_role_wins_over_first_uploaded_profile_for_identity_and_qc(self):
+        element = create_element(
+            self.workspace, name="Presenter", handle="char3", element_type="character",
+            description="Short black hair and a full dark beard.",
+            uploads=[
+                UploadedElementAsset("profile.png", "image/png", image_bytes((0, 255, 0)), role="profile"),
+                UploadedElementAsset("face.png", "image/png", image_bytes((255, 0, 0)), role="face"),
+                UploadedElementAsset("costume.png", "image/png", image_bytes((0, 0, 255)), role="costume"),
+            ],
+        )
+        profile = next(asset for asset in element["assets"] if asset["role"] == "profile")
+        element_service.update_element(self.workspace, element["id"], {"primary_asset_id": profile["id"]})
+        binding = ElementBinding(element_id=element["id"], handle="char3", wardrobe_policy="prompt")
+        resolved = resolve_element_bindings(self.workspace, [binding])
+        self.assertEqual(resolved[0].reference_asset_roles[0], "profile")
+        with tempfile.TemporaryDirectory() as tmp:
+            sheet = build_reference_sheet(resolved, Path(tmp) / "sheet.png")
+            with Image.open(sheet).convert("RGB") as image:
+                colors = {color for _, color in image.getcolors(image.width * image.height)}
+                self.assertIn((255, 0, 0), colors)
+                self.assertNotIn((0, 255, 0), colors)
+                self.assertNotIn((0, 0, 255), colors)
+        qc_path = element_service.canonical_reference_paths(resolved)[0][1]
+        self.assertEqual(str(qc_path), resolved[0].reference_asset_paths[1])
+
+        # Explicit start-frame selection continues to honor the chosen primary.
+        start = resolve_element_bindings(self.workspace, [binding.model_copy(update={"reference_mode": "start_frame"})])
+        self.assertEqual(str(element_service.canonical_reference_paths(start)[0][1]), start[0].primary_asset_path)
+
+    def test_reference_wardrobe_honors_primary_costume_photo(self):
+        element = create_element(
+            self.workspace, name="Presenter", handle="char3", element_type="character", description="Full beard.",
+            uploads=[
+                UploadedElementAsset("face.png", "image/png", image_bytes((255, 0, 0)), role="face"),
+                UploadedElementAsset("costume.png", "image/png", image_bytes((0, 0, 255)), role="costume"),
+            ],
+        )
+        costume = next(asset for asset in element["assets"] if asset["role"] == "costume")
+        element_service.update_element(self.workspace, element["id"], {"primary_asset_id": costume["id"]})
+        resolved = resolve_element_bindings(self.workspace, [ElementBinding(
+            element_id=element["id"], handle="char3", wardrobe_policy="reference",
+        )])
+        with tempfile.TemporaryDirectory() as tmp:
+            sheet = build_reference_sheet(resolved, Path(tmp) / "sheet.png")
+            with Image.open(sheet).convert("RGB") as image:
+                colors = {color for _, color in image.getcolors(image.width * image.height)}
                 self.assertIn((0, 0, 255), colors)
+                self.assertNotIn((255, 0, 0), colors)
 
 
     def test_character_uploads_receive_semantic_roles_in_order(self):

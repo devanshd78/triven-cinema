@@ -318,28 +318,18 @@ def compose_render_integrity_prompt(
 
     blocks = [prompt, marker]
     blocks.append(
-        "Preserve one coherent physical version of every subject and object from first frame to last. "
-        "No duplicate face/body, identity swap, facial melting, asymmetric eye drift, extra teeth, extra fingers or limbs, "
-        "fused hands, floating objects, warped straight edges, geometry popping, texture crawling, or unexplained prop duplication."
-    )
-    blocks.append(
-        "FABRIC / MATERIAL INTEGRITY: clothing must remain one physically plausible garment with stable seams, sleeves, neckline, "
-        "knit/weave, colors and pattern. Do not melt, splice, morph, add random straps/buttons/zippers, or blend two outfits together."
+        "Each subject retains the same recognizable face, anatomy and proportions throughout the shot. "
+        "Clothing, props and set geometry remain physically coherent, with stable materials and colors. "
+        "Motion follows the described action from the opening frame."
     )
     if prompt_wardrobe_authoritative:
         blocks.append(
-            "WARDROBE AUTHORITY: any clothing described in this scene prompt overrides clothing visible in the identity reference. "
-            "Use the reference for the person's identity, not as a costume instruction. Reproduce the requested garment exactly and coherently."
+            "WARDROBE AUTHORITY: the scene's clothing description overrides clothing in the identity reference."
         )
     if realism_profile in {"real_skin", "identity_max"}:
         blocks.append(
-            "PHOTOREAL HUMAN INTEGRITY: retain natural skin microtexture, pores, fine hairs, subtle asymmetry and believable eye moisture; "
-            "avoid waxy smoothing, porcelain skin, beauty-filter sheen, CGI gloss, excessive sharpening or painted facial detail."
+            "Skin and hair retain natural photographic detail under the lighting described in the scene."
         )
-    blocks.append(
-        "TEMPORAL INTEGRITY: visible motion starts naturally at the beginning; no frozen reference hold, sudden first-seconds redesign, "
-        "or progressive face/wardrobe mutation. Keep set geometry, desk/microphone placement and major background objects stable unless the scene asks them to move."
-    )
     if retry_level > 0 and qc_feedback:
         blocks.append("RENDER QC RETRY: Correct this previously observed issue: " + compact_text(qc_feedback, 300))
     return "\n\n".join(block for block in blocks if block)

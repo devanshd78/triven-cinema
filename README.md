@@ -321,6 +321,30 @@ For a faster draft, select Preview and Standard in the existing controls; Charac
 
 API retry/progress changes require an API rebuild; worker startup/timing changes require `modal deploy modal/app.py`. GPU speedup must be measured with comparable real renders after readiness passes.
 
+## Presenter reference and prompt validation
+
+Character conditioning now uses one portrait per character rather than combining several photos of the same person into a collage. With **Follow scene prompt**, a labeled face takes priority over a profile and the scene must describe the desired clothes explicitly. With **Lock reference outfit**, the selected primary photo supplies both the person and the outfit. Other uploads remain saved. Visual QC uses the same selected identity reference as generation.
+
+Put spoken words in **Spoken dialogue**, including Hindi, and ambience/voice direction in **Sound direction**. Unquoted narration pasted into a visual prompt is not automatically treated as speech. Hindi sentence punctuation is supported when distributing dialogue across storyboard scenes.
+
+The Modal worker preserves the original take before successful texture refinement. When the refined video fails visual QC, the API checks that original before requesting another GPU render. It selects the original only on a passing QC verdict; failed and unavailable checks cannot approve it. Both takes remain available as generated assets, and cost accounting includes all work already performed. This requires the updated worker and API together; old workers remain compatible but cannot return the original take.
+
+For a small initial presenter test, use one 10-second shot, 16:9, 1080p, Standard, Identity / Element reference, and Follow scene prompt. Keep one clear face photo labeled `face`; avoid group photos as the active portrait. Use an explicit outfit description instead of asking the renderer to infer a costume filename. For example:
+
+**Visual prompt**
+
+> A single continuous medium shot of @char3 presenting one matte-black smartphone in a modern technology studio. He stands behind a wooden desk, wearing a plain black long-sleeved button-up shirt with an open collar. He looks into the camera and speaks with a friendly expression, holding the phone upright in his right hand at chest height. His left hand makes one small explanatory gesture, then rests on the desk. A soft key light illuminates his face evenly; the neutral studio background stays gently out of focus. The eye-level camera remains still, with the presenter, his hands and the phone clearly visible throughout. The picture is clean and full-frame, with one presenter, one phone, and an unobstructed view.
+
+**Spoken dialogue**
+
+> नमस्कार दोस्तों! आज हम इस स्मार्टफोन की स्क्रीन और कैमरे को करीब से देखेंगे।
+
+**Sound direction**
+
+> One warm, conversational Hindi male voice, clear speech synchronized with the visible presenter, and quiet studio room tone. No background music or additional voices.
+
+This is a validation recipe, not a guarantee of matching a real person's face or voice. Check the first, middle and last frames for a physical presenter in the studio, stable identity, one phone in the right hand, coherent clothing, and clean imagery. Listen for the exact line without repetitions. Only after that passes should the second camera angle and longer script be added. [LTX's prompting guide](https://docs.ltx.io/open-source-model/usage-guides/prompting-guide) recommends a focused shot with concrete action and clear camera/audio direction; [Ingredients documentation](https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Ingredients) describes the separate reference/target structure used internally.
+
 ## Character continuity for multi-scene stories
 
 Storyboard mode now defaults to **Strict continuity**. Triven creates one shared character bible and one shared visual-style bible, injects the same immutable identity locks into every scene prompt, and keeps the same seed across the whole story. After each rendered scene, FastAPI extracts the final video frame. The next Modal/LTX-2.5 render receives that PNG as frame-0 image conditioning, so the next clip starts from the actual visual identity produced by the previous clip instead of reinterpreting the character from text alone.

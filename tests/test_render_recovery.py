@@ -18,6 +18,19 @@ from app.services.continuity_qc import ContinuityQCResult
 from app.services.audio_qc import AudioQCResult
 from app.services.job_service import get_job, submit_job, workspace_owns_generated_file
 from app.api.routes import generations
+from inference.providers.base import VideoGenerationResult
+
+
+def refined_take(root):
+    refined = root / "refined.mp4"
+    base = root / "before-refinement.mp4"
+    refined.write_bytes(b"bad texture pass")
+    base.write_bytes(b"original picture and audio")
+    return VideoGenerationResult(
+        filename=refined.name, path=str(refined), base_path=str(base), seed=42,
+        render_details="Test texture pass", render_seconds=120, wall_seconds=125,
+        prompt="A presenter in a studio.", provider="modal", detail_refined=True,
+    )
 
 
 @contextmanager
@@ -81,6 +94,23 @@ def request(**changes):
 
 
 class RenderRecoveryTests(unittest.TestCase):
+    def test_good_base_avoids_another_factory_gpu_render(self):
+        with fake_factory() as state:
+            take = refined_take(state.root)
+            state.renderer.side_effect = None
+            state.renderer.return_value = take
+            state.inspector.side_effect = [ContinuityQCResult(passed=False, artifact_detected=True, note="Glare overlay"),
+                                           ContinuityQCResult(passed=True, note="Clean studio picture")]
+            result = factory.run_factory_generation(request(continuity_max_retries=1), workspace_id="audit")
+            state.renderer.assert_called_once()
+            self.assertEqual(result.visual_qc_status, "passed")
+            self.assertEqual(result.continuity_regenerations, 0)
+            self.assertFalse(result.detail_refined)
+            self.assertEqual(result.scene_results[0]["filename"], Path(take.base_path).name)
+            self.assertEqual(len(result.scene_results[0]["visual_qc_attempts"]), 2)
+            self.assertTrue(Path(take.path).exists())
+            self.assertTrue(workspace_owns_generated_file("audit", Path(take.base_path).name))
+
     def test_retry_gpu_failure_keeps_first_candidate(self):
         with fake_factory(fail_render=2, visual=ContinuityQCResult(passed=False, note="Identity drift")) as state:
             result = factory.run_factory_generation(request(continuity_max_retries=1), workspace_id="audit")
@@ -157,6 +187,44 @@ class RenderRecoveryTests(unittest.TestCase):
 
 
 class QCValidationTests(unittest.TestCase):
+    def test_base_with_failed_or_unavailable_qc_never_replaces_refined_take(self):
+        for verdict in (ContinuityQCResult(passed=False, note="Wrong face"),
+                        ContinuityQCResult(passed=True, skipped=True, note="Provider unavailable")):
+            with self.subTest(verdict=verdict), tempfile.TemporaryDirectory() as tmp:
+                take = refined_take(Path(tmp))
+                failed = ContinuityQCResult(passed=False, note="Texture artifacts")
+                result, qc, attempt = review.recover_before_refinement(
+                    take, failed, inspect=Mock(return_value=verdict), workspace_id=None, scene_index=0,
+                )
+                self.assertIs(result, take)
+                self.assertIs(qc, failed)
+                self.assertFalse(attempt["selected"])
+                self.assertTrue(Path(take.base_path).exists())
+
+    def test_base_is_not_rechecked_when_refined_qc_passes_or_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            take = refined_take(Path(tmp))
+            inspect = Mock()
+            for verdict in (ContinuityQCResult(passed=True), ContinuityQCResult(passed=False, skipped=True), None):
+                result, qc, attempt = review.recover_before_refinement(
+                    take, verdict, inspect=inspect, workspace_id=None, scene_index=0,
+                )
+                self.assertIs(result, take)
+                self.assertIsNone(attempt)
+            inspect.assert_not_called()
+
+    def test_base_recovery_preserves_paid_timing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            take = refined_take(Path(tmp))
+            result, _, _ = review.recover_before_refinement(
+                take, ContinuityQCResult(passed=False), inspect=Mock(return_value=ContinuityQCResult(passed=True)),
+                workspace_id=None, scene_index=0,
+            )
+            self.assertEqual(result.render_seconds, 120)
+            self.assertEqual(result.wall_seconds, 125)
+            self.assertFalse(result.detail_refined)
+            self.assertIsNone(result.base_path)
+
     def test_incomplete_visual_verdict_is_unavailable(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve(); frame = root / "frame.png"; frame.write_bytes(b"image")
@@ -184,6 +252,29 @@ class QCValidationTests(unittest.TestCase):
 
 
 class DirectAndCompositionTests(unittest.TestCase):
+    def test_good_base_avoids_another_direct_gpu_render(self):
+        with fake_factory() as state, ExitStack() as stack:
+            take = refined_take(state.root)
+            state.renderer.side_effect = None
+            state.renderer.return_value = take
+            state.inspector.side_effect = [ContinuityQCResult(passed=False, artifact_detected=True), ContinuityQCResult(passed=True)]
+            for name, value in {
+                "GENERATED_DIR": state.root, "ensure_minimum_free_disk": Mock(),
+                "get_video_provider": Mock(return_value=state.provider), "render_long_clip": state.renderer,
+                "evaluate_scene_cardinality": state.inspector,
+                "prepare_delivery": Mock(side_effect=lambda path, **_: path),
+                "_media_info": Mock(return_value=MediaInfo(duration_seconds=15, has_audio=True)),
+                "estimate_gpu_cost": Mock(return_value=(0., 0., "test")), "record_generation_metric": Mock(),
+            }.items():
+                stack.enter_context(patch.object(generations, name, value))
+            result = generations._generate_video_impl(VideoGenerationRequest(
+                prompt="A presenter in a studio.", duration_seconds=15, provider="modal", audio_mode="mute", continuity_max_retries=1,
+            ))
+            state.renderer.assert_called_once()
+            self.assertEqual(result.visual_qc_status, "passed")
+            self.assertEqual(result.filename, Path(take.base_path).name)
+            self.assertFalse(result.detail_refined)
+
     def test_direct_audio_qc_receives_immutable_script(self):
         with fake_factory() as state, ExitStack() as stack:
             for name, value in {

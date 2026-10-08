@@ -21,7 +21,7 @@ from app.services.element_service import (
 from app.services.long_render_service import render_long_clip
 from app.services.dialogue_service import build_audio_prompt, separate_visual_and_script
 from app.services.job_service import checkpoint_job_result
-from app.services.render_review_service import aggregate_qc, pass_flag, qc_report, register_render, review_audio
+from app.services.render_review_service import aggregate_qc, pass_flag, qc_report, recover_before_refinement, register_render, review_audio
 from app.services.media_probe import probe_media
 from app.services.metrics_service import estimate_gpu_cost, record_generation_metric
 from app.services.scene_planner import create_prompt_only_plan, create_scene_plan
@@ -381,17 +381,19 @@ def run_factory_generation(
                 gpu = result.gpu or gpu
 
                 qc = None
+                def inspect_visual(candidate_path: Path):
+                    return evaluate_scene_cardinality(
+                        candidate_path, entity_locks=plan.entity_locks,
+                        visible_entity_counts=scene.visible_entity_counts,
+                        character_bible=plan.character_bible, scene_prompt=locked_prompt,
+                        qc_mode=effective_qc_mode, reference_frame_path=scene_reference_frame,
+                        canonical_reference_paths=element_canonical_reference_paths(active_elements),
+                    )
                 if effective_qc_mode != "off":
                     if progress:
                         progress("rendering", min(79, base_progress + 2), f"Scene {index + 1}/{scene_count} · inspecting visual identity and artifacts...")
                     try:
-                        qc = evaluate_scene_cardinality(
-                            path, entity_locks=plan.entity_locks,
-                            visible_entity_counts=scene.visible_entity_counts,
-                            character_bible=plan.character_bible, scene_prompt=locked_prompt,
-                            qc_mode=effective_qc_mode, reference_frame_path=scene_reference_frame,
-                            canonical_reference_paths=element_canonical_reference_paths(active_elements),
-                        )
+                        qc = inspect_visual(path)
                     except Exception as exc:
                         qc = ContinuityQCResult(skipped=True, note=f"Visual QC unavailable ({type(exc).__name__}).")
                 visual_report = qc_report(qc)
@@ -400,6 +402,16 @@ def run_factory_generation(
                 register_render(workspace_id, path, kind="scene", scene_index=index,
                                 visual_qc_status=visual_report["status"], visual_qc=visual_report,
                                 visual_qc_attempts=scene_attempts)
+                result, qc, base_review = recover_before_refinement(
+                    result, qc, inspect=inspect_visual, workspace_id=workspace_id, scene_index=index,
+                    progress=(lambda message: progress("rendering", min(79, base_progress + 2), f"Scene {index + 1}/{scene_count} · {message}")) if progress else None,
+                )
+                if base_review:
+                    scene_attempts.append({"attempt": attempt + 1, **base_review})
+                    if base_review["selected"]:
+                        accepted_result, accepted_path = result, Path(result.path)
+                        visual_report = qc_report(qc)
+                        continuity_warnings.append(f"Scene {index + 1}: texture refinement failed visual QC; the original take passed and was selected without another GPU render.")
                 if visual_report["status"] != "failed":
                     if visual_report["status"] == "unavailable":
                         continuity_warnings.append(f"Scene {index + 1}: {visual_report['note']}")

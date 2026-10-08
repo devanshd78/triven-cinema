@@ -53,6 +53,7 @@ class ModalPreservationTests(unittest.TestCase):
         result = self.run_worker(None)
         self.assertEqual(result["video_bytes"], b"refined-with-original-audio")
         self.assertTrue(result["detail_refined"])
+        self.assertEqual(result["base_video_bytes"], b"successful-base-with-audio")
         self.assertIn('base_generation', result['timings_seconds'])
         self.assertIn('detail_refinement', result['timings_seconds'])
         self.assertTrue(all(value >= 0 for value in result['timings_seconds'].values()))

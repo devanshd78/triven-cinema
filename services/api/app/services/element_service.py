@@ -723,36 +723,24 @@ def compile_element_prompt(scene_prompt: str, bindings: list[ResolvedElementBind
             if binding.type == "character" and binding.wardrobe_policy == "prompt":
                 description = _identity_only_description(binding.description)
                 wardrobe_note = (
-                    " Identity reference only: preserve face, hairline, age, skin and stable body proportions. "
-                    "Ignore clothing visible in the reference; the Generated video wardrobe is authoritative."
+                    " Facial identity reference; the Generated video wardrobe is authoritative."
                 )
             else:
                 description = " ".join(binding.description.split())[:420]
                 wardrobe_note = (
-                    " Preserve the reference wardrobe exactly unless the scene explicitly changes it."
+                    " Preserve the wardrobe in this selected primary reference unless the scene explicitly changes it."
                     if binding.type == "character" else ""
                 )
-            panel_lines.append(
-                f"Panel {index}: {binding.type.upper()} {binding.name}. {description}{wardrobe_note}".rstrip()
-            )
+            label = "Single character portrait" if len(bindings) == 1 and binding.type == "character" else f"Panel {index}: {binding.type}"
+            panel_lines.append(f"{label} of {binding.name}. {description}{wardrobe_note}".rstrip())
         blocks.append("Reference sheet: " + " ".join(panel_lines))
-        blocks.append(
-            "REFERENCE BEHAVIOR: The reference sheet defines appearance only, not timing. "
-            "Begin visible natural motion immediately on the first generated frames; do not hold, freeze, "
-            "or replay the reference sheet as an opening shot unless the user explicitly asks for a still hold."
+        # Keep the model's trained two-part format: appearance in Reference
+        # sheet, action in Generated video. Long procedural instructions between
+        # them obscure the requested shot and make the sheet itself too prominent.
+        action += (
+            " The referenced subjects physically inhabit the requested scene, with natural motion from the opening. "
+            "The reference image supplies appearance; the requested scene supplies the composition and background."
         )
-        prompt_wardrobe = [
-            binding.name for binding in identity_bindings
-            if binding.type == "character" and binding.wardrobe_policy == "prompt"
-        ]
-        if prompt_wardrobe:
-            blocks.append(
-                "IDENTITY / WARDROBE SEPARATION: For " + ", ".join(prompt_wardrobe) +
-                ", use the reference for facial identity, hairline, age and stable human proportions only. "
-                "The Generated video wardrobe description is authoritative. Do not copy, blend, layer, recolor, "
-                "or hybridize clothing from the reference image when the scene specifies different clothing. "
-                "Keep one coherent garment construction with the exact requested colors, pattern and material."
-            )
 
     if start_frame_bindings:
         blocks.append(
@@ -826,13 +814,20 @@ def _reference_assets_for_panel(binding: ResolvedElementBinding) -> list[tuple[s
     if binding.wardrobe_policy == "prompt":
         # Face/profile references are safe identity signals when the scene asks for
         # a different outfit. Full-body/costume panels can overpower the text prompt.
-        identity = [item for item in pairs if item[1] in {"face", "profile"}]
+        # A profile may be the first upload/primary and may contain another
+        # person. Prefer an explicitly labeled face regardless of upload order.
+        identity = sorted(
+            [item for item in pairs if item[1] in {"face", "profile"}],
+            key=lambda item: 0 if item[1] == "face" else 1,
+        )
         fallback = [item for item in pairs if item[1] not in {"full_body", "costume"}]
         selected = identity or fallback or pairs[:1]
-        return selected[:2]
+        return selected[:1]
 
-    priority = {"face": 0, "primary": 1, "full_body": 2, "profile": 3, "costume": 4, "support": 5}
-    return sorted(pairs, key=lambda item: priority.get(item[1], 6))[:3]
+    # Reference wardrobe means the user's selected primary image is canonical.
+    # Mixing separate face/body/costume photos invents several compositions and
+    # often conflicting garments for a single person.
+    return [(binding.primary_asset_path, next((role for path, role in pairs if path == binding.primary_asset_path), "primary"))]
 
 
 def _paste_element_panel(canvas: Image.Image, binding: ResolvedElementBinding, box: tuple[int, int, int, int]) -> None:
@@ -882,10 +877,10 @@ def build_reference_sheet(bindings: list[ResolvedElementBinding], output_path: P
         # An identity-only solo presenter needs ONE reference portrait, not a
         # side-by-side multi-view contact sheet. The latter can be reproduced as
         # a split-screen artifact when Ingredients conditioning is strong.
-        if count == 1 and binding.type == "character" and binding.wardrobe_policy == "prompt":
+        if count == 1 and binding.type == "character":
             assets = _reference_assets_for_panel(binding)
             if assets:
-                paste = _paste_contained if assets[0][1] in {"face", "profile"} else _paste_face_priority_crop
+                paste = _paste_face_priority_crop if binding.wardrobe_policy == "prompt" and assets[0][1] not in {"face", "profile"} else _paste_contained
                 paste(canvas, assets[0][0], (4, 4, width - 4, height - 4))
             break
         col = index % columns
@@ -907,4 +902,13 @@ def build_reference_sheet(bindings: list[ResolvedElementBinding], output_path: P
 
 
 def canonical_reference_paths(bindings: list[ResolvedElementBinding]) -> list[tuple[str, Path]]:
-    return [(f"@{binding.handle}", Path(binding.primary_asset_path)) for binding in bindings]
+    # Inspect against the same portrait used for generation. The primary upload
+    # may be a full-body/group photo that was superseded by a labeled face.
+    return [
+        (f"@{binding.handle}", Path(
+            _reference_assets_for_panel(binding)[0][0]
+            if binding.type == "character" and binding.reference_mode == "identity"
+            else binding.primary_asset_path
+        ))
+        for binding in bindings
+    ]
