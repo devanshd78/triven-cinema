@@ -8,6 +8,7 @@ import modal
 from dotenv import load_dotenv
 
 from inference.providers.base import VideoGenerationResult, VideoProvider
+from inference.prompting import PROMPT_FORMAT_VERSION, normalize_ltx_prompt
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -87,6 +88,7 @@ class ModalLTXProvider(VideoProvider):
         realism_profile: str = "standard",
     ) -> VideoGenerationResult:
         started = time.perf_counter()
+        prompt = normalize_ltx_prompt(prompt)
 
         reference_bytes: bytes | None = None
         reference_suffix = ".png"
@@ -175,6 +177,7 @@ class ModalLTXProvider(VideoProvider):
             detail_refined=bool(result.get("detail_refined", False)),
             timings_seconds=timings_seconds,
             base_path=str(base_destination) if base_destination else None,
+            prompt_format=str(result.get("prompt_format") or PROMPT_FORMAT_VERSION),
         )
 
     def retake_audio(
@@ -185,6 +188,7 @@ class ModalLTXProvider(VideoProvider):
         duration_seconds: float,
         seed: int,
     ) -> VideoGenerationResult:
+        prompt = normalize_ltx_prompt(prompt)
         source = Path(video_path)
         if not source.exists():
             raise FileNotFoundError(f"Audio Retake source video not found: {source.name}")
@@ -223,4 +227,5 @@ class ModalLTXProvider(VideoProvider):
             reference_conditioned=True,
             chunk_count=1,
             render_mode="audio-retake",
+            prompt_format=str(result.get("prompt_format") or PROMPT_FORMAT_VERSION),
         )

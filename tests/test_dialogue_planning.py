@@ -54,8 +54,9 @@ class DialoguePlanningTests(unittest.TestCase):
 
     def test_prompt_compiler_has_explicit_silent_state(self):
         result = build_audio_prompt("Same face identity and reference image.", "", "Quiet room tone.")
-        self.assertIn("VISUAL INSTRUCTIONS — NEVER SPOKEN", result)
-        self.assertIn("No dialogue", result)
+        self.assertNotIn("NEVER SPOKEN", result)
+        self.assertNotIn("[SPOKEN SCRIPT]", result)
+        self.assertIn("without speech", result)
 
     def test_unicode_legacy_dialogue_is_preserved(self):
         plan = create_prompt_only_plan('The presenter says “नमस्ते दोस्तों।”', 1)

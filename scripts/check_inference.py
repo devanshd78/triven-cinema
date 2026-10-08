@@ -11,9 +11,11 @@ sys.path[:0] = [str(ROOT), str(ROOT / 'services' / 'api')]
 def main() -> int:
     from app.core.config import settings
     from inference.providers.router import get_video_provider
+    from inference.prompting import PROMPT_FORMAT_VERSION
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--all', action='store_true', help='Check every enabled production rendering recipe')
+    parser.add_argument('--require-current-worker', action='store_true', help='Require the worker prompt compiler to match this API build')
     args = parser.parse_args()
     provider = get_video_provider(settings.video_provider, model='ltx-2.5')
     recipes = [('1080p standard', dict(render_mode='dfr', decoder='diffusion', realism_profile='standard'))]
@@ -30,7 +32,10 @@ def main() -> int:
             manifest = provider.preflight(**recipe, force_refresh=True)
             if not manifest.get('ready'):
                 raise RuntimeError('; '.join(manifest.get('errors') or ['Readiness could not be verified.']))
-            print(f"[OK] {label}: worker protocol {manifest.get('protocol_version')}, LTX {manifest.get('ltx_repo_ref')}, GPU {manifest.get('gpu')}")
+            if args.require_current_worker and manifest.get('prompt_format') != PROMPT_FORMAT_VERSION:
+                raise RuntimeError('The worker in this Modal workspace has not received the current prompt fix. '
+                                   'Run scripts/deploy_hostinger.sh --deploy-worker from the VPS checkout using its production .env.')
+            print(f"[OK] {label}: worker protocol {manifest.get('protocol_version')}, LTX {manifest.get('ltx_repo_ref')}, GPU {manifest.get('gpu')}, prompt format {manifest.get('prompt_format', 'legacy / not reported')}")
         except Exception as exc:
             failures += 1
             print(f'[FAIL] {label}: {exc}', file=sys.stderr)

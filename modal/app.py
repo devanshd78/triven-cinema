@@ -7,6 +7,8 @@ from pathlib import Path
 
 import modal
 
+from inference.prompting import PROMPT_FORMAT_VERSION, normalize_ltx_prompt
+
 from ltx_worker import (
     build_command,
     build_refine_details_command,
@@ -21,7 +23,7 @@ from models import DETAILING_LORA, INGREDIENTS_LORA, MODEL_ROOT, REFINE_DETAILS_
 from retake_worker import retake_audio_only
 
 
-APP_NAME = "triven-cinema-ltx"
+APP_NAME = os.getenv("MODAL_APP_NAME", "triven-cinema-ltx").strip() or "triven-cinema-ltx"
 GPU_TYPE = os.getenv("TRIVEN_MODAL_GPU", "B200")
 SCALEDOWN_WINDOW = int(os.getenv("TRIVEN_MODAL_SCALEDOWN_WINDOW", "15"))
 # Pin a tested public LTX release. Do not silently build production workers from
@@ -48,7 +50,7 @@ image = (
         f"cd /opt/LTX-2 && git fetch --depth 1 origin {LTX_REPO_REF} && git checkout --detach FETCH_HEAD",
         "cd /opt/LTX-2 && uv sync --extra natten",
     )
-    .add_local_python_source("ltx_worker", "models", "retake_worker")
+    .add_local_python_source("ltx_worker", "models", "retake_worker", "inference")
 )
 
 
@@ -112,7 +114,8 @@ def _missing_base_models() -> list[str]:
     return [path for path in REQUIRED_MODEL_FILES if not (MODEL_ROOT / path).exists()]
 
 
-@app.function(image=image, secrets=[hf_secret], volumes={"/models": models_volume}, timeout=120)
+@app.function(image=image, secrets=[hf_secret], volumes={"/models": models_volume}, timeout=120,
+              name=os.getenv("MODAL_PREFLIGHT_FUNCTION_NAME", "preflight"))
 def preflight(render_mode: str = "distilled", realism_profile: str = "standard", element_reference_required: bool = False, operation: str = "generate", decoder: str = "conv") -> dict:
     """CPU-only manifest check; never allocate a GPU to discover missing weights."""
     models_volume.reload()
@@ -139,6 +142,7 @@ def preflight(render_mode: str = "distilled", realism_profile: str = "standard",
     else:
         errors.extend(check_model_file_access(paths, token))
     return {"ready": not errors, "supported": True, "protocol_version": 2, "ltx_repo_ref": LTX_REPO_REF,
+            "prompt_format": PROMPT_FORMAT_VERSION,
             "gpu": GPU_TYPE, "operation": operation, "required_models": [str(p.relative_to(MODEL_ROOT)) for p in paths],
             "missing_models": missing, "errors": errors}
 
@@ -146,6 +150,7 @@ def preflight(render_mode: str = "distilled", realism_profile: str = "standard",
 @app.function(
     image=image,
     gpu=GPU_TYPE,
+    name=os.getenv("MODAL_FUNCTION_NAME", "generate_video"),
     secrets=[hf_secret],
     volumes={"/models": models_volume},
     timeout=60 * 60,
@@ -168,6 +173,7 @@ def generate_video(
     realism_profile: str = "standard",
 ) -> dict:
     del enhance_prompt  # Prompt enhancement currently happens in Triven/Gemini.
+    prompt = normalize_ltx_prompt(prompt)
 
     mode = (render_mode or "distilled").strip().lower()
     realism = (realism_profile or "standard").strip().lower()
@@ -295,6 +301,7 @@ def generate_video(
         "base_video_bytes": base_video_bytes,
         "seed": seed,
         "prompt": prompt,
+        "prompt_format": PROMPT_FORMAT_VERSION,
         "render_details": (
             f"{width}x{height} · {duration_seconds:.2f}s · "
             + (
@@ -331,6 +338,7 @@ def generate_video(
 @app.function(
     image=image,
     gpu=GPU_TYPE,
+    name=os.getenv("MODAL_AUDIO_RETAKE_FUNCTION_NAME", "retake_audio"),
     secrets=[hf_secret],
     volumes={"/models": models_volume},
     timeout=60 * 60,
@@ -343,6 +351,7 @@ def retake_audio(
     seed: int = 42,
 ) -> dict:
     """Regenerate only the LTX audio stream while freezing the source video."""
+    prompt = normalize_ltx_prompt(prompt)
     missing = [str(path.relative_to(MODEL_ROOT)) for path in required_model_paths(operation="retake_audio")
                if not path.is_file() or path.stat().st_size == 0]
     if missing:
@@ -383,6 +392,7 @@ def retake_audio(
         "reference_conditioned": True,
         "chunk_count": 1,
         "render_mode": "audio-retake",
+        "prompt_format": PROMPT_FORMAT_VERSION,
     }
 
 

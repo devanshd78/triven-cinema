@@ -1,7 +1,8 @@
 """Keep user-authored speech outside lossy visual-prompt planning."""
 
-import json
 import re
+
+from inference.prompting import compile_native_prompt
 
 
 _QUOTED = r'(?P<quote>"[^"\n]+"|“[^”\n]+”|‘[^’\n]+’|\x27[^\x27\n]+\x27)'
@@ -69,18 +70,5 @@ def split_spoken_script(script: str, scene_count: int) -> list[str]:
 
 def build_audio_prompt(visual_prompt: str, spoken_script: str, audio_direction: str | None = None) -> str:
     """Compile LTX's single text input from separately stored visual/audio data."""
-    visual, _ = separate_visual_and_script(visual_prompt, spoken_script)
-    blocks = []
-    if visual:
-        blocks.append("[VISUAL INSTRUCTIONS — NEVER SPOKEN]\n" + visual)
-    if audio_direction and audio_direction.strip():
-        blocks.append("[SOUND DIRECTION — NEVER SPOKEN]\n" + audio_direction.strip())
-    script = (spoken_script or "").strip()
-    blocks.append(
-        "[SPOKEN SCRIPT]\nSpeak exactly the following words once, in order; no other narration, "
-        "instructions, repetition or invented speech. Synchronize the visible speaker's lips:\n"
-        + json.dumps(script, ensure_ascii=False)
-        if script else
-        "[SPOKEN SCRIPT]\nNo dialogue, narration, singing, chanting or speech-like vocal sounds. Use only requested ambience, Foley or music."
-    )
-    return "\n\n".join(blocks)
+    visual, script = separate_visual_and_script(visual_prompt, spoken_script)
+    return compile_native_prompt(visual, script, audio_direction)

@@ -21,6 +21,7 @@ class VideoGenerationResult:
     detail_refined: bool = False
     timings_seconds: dict[str, float] = field(default_factory=dict)
     base_path: str | None = None
+    prompt_format: str | None = None
 
 
 class VideoProvider(ABC):

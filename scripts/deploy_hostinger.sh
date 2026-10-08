@@ -4,6 +4,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 COMPOSE=(docker compose -f docker-compose.production.yml)
+DEPLOY_WORKER=false
+case "${1:-}" in
+  "") ;;
+  --deploy-worker) DEPLOY_WORKER=true ;;
+  *) echo "Usage: $0 [--deploy-worker]" >&2; exit 2 ;;
+esac
 
 if [ ! -f .env ]; then
   echo "Missing .env. Copy .env.production.example to .env and configure it first." >&2
@@ -19,9 +25,15 @@ python3 scripts/production_preflight.py
 python3 scripts/backup_state.py
 
 "${COMPOSE[@]}" build --pull
+# Deploy from the new API image so the worker code, pinned LTX ref, Modal token
+# and Modal environment are exactly those used by this VPS. Do not use a local
+# developer's active Modal profile, which can point at a different workspace.
+if [ "$DEPLOY_WORKER" = true ]; then
+  "${COMPOSE[@]}" run --rm --no-deps api python -m modal deploy modal/app.py --strategy rolling
+fi
 # Validate the deployed CPU worker and model manifest before replacing the API.
 # This check performs no GPU render.
-"${COMPOSE[@]}" run --rm --no-deps api python /app/scripts/check_inference.py --all
+"${COMPOSE[@]}" run --rm --no-deps api python /app/scripts/check_inference.py --all --require-current-worker
 "${COMPOSE[@]}" up -d --remove-orphans
 
 echo "Waiting for API readiness..."

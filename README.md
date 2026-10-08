@@ -323,6 +323,17 @@ API retry/progress changes require an API rebuild; worker startup/timing changes
 
 ## Presenter reference and prompt validation
 
+The API and Modal worker now compile natural scene descriptions with quoted dialogue. Application headings such as `VISUAL INSTRUCTIONS — NEVER SPOKEN`, `SPOKEN SCRIPT`, and Triven's internal continuity markers are excluded from the final model input; they were susceptible to appearing as generated text/document layouts. The worker also adapts the old API envelope while preserving its dialogue. The Ingredients-specific `Reference sheet:` / `Generated video:` structure remains intact.
+
+Deploy the fix **from the production VPS checkout**, after updating its source:
+
+```bash
+./scripts/deploy_hostinger.sh --deploy-worker
+curl -fsS https://devansh.info/api/v1/health
+```
+
+This uses the production `.env` credentials and Modal environment for both worker deployment and API checks, instead of a developer machine's unrelated workspace. It backs up state, builds the API/web, deploys the worker, and requires a matching prompt compiler before replacing application containers. The public health response must report `"prompt_format":"ltx-native-scene-v1"`; the CPU inference check must report the same worker format. These checks verify deployment, not generated picture quality. The script does not raise workspace spending limits or perform a paid GPU render.
+
 Character conditioning now uses one portrait per character rather than combining several photos of the same person into a collage. With **Follow scene prompt**, a labeled face takes priority over a profile and the scene must describe the desired clothes explicitly. With **Lock reference outfit**, the selected primary photo supplies both the person and the outfit. Other uploads remain saved. Visual QC uses the same selected identity reference as generation.
 
 Put spoken words in **Spoken dialogue**, including Hindi, and ambience/voice direction in **Sound direction**. Unquoted narration pasted into a visual prompt is not automatically treated as speech. Hindi sentence punctuation is supported when distributing dialogue across storyboard scenes.

@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException
 
 from app.core.config import settings
 from app.services.auth_service import AuthError, validate_auth_configuration
+from inference.prompting import PROMPT_FORMAT_VERSION
 
 
 router = APIRouter()
@@ -34,6 +35,7 @@ async def health_check():
         "status": "ok",
         "service": "triven-cinema-api",
         "environment": settings.app_env,
+        "prompt_format": PROMPT_FORMAT_VERSION,
     }
 
 

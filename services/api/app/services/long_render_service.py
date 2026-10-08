@@ -20,6 +20,7 @@ def _register_render(result: VideoGenerationResult, *, part: int | None = None) 
         "render_state": "generated", "visual_qc_status": "not_checked", "audio_qc_status": "not_checked",
         "continuation_part": part, "provider": result.provider,
         "timings_seconds": getattr(result, "timings_seconds", {}),
+        "prompt_format": getattr(result, "prompt_format", None),
     })
     base_path = getattr(result, "base_path", None)
     if base_path:
