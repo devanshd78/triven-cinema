@@ -2,6 +2,7 @@ import uuid
 from pathlib import Path
 
 from app.services.video_combiner import process_audio, transcode_delivery
+from app.services.job_service import register_current_generated_asset
 
 
 GENERATED_DIR = (Path(__file__).resolve().parents[4] / "storage" / "generated").resolve()
@@ -55,11 +56,12 @@ def prepare_delivery(
             quality=quality,
         )
 
+    register_current_generated_asset(quality_path.name, metadata={"kind": "delivery_source", "quality": quality})
+
     if audio_mode == "native":
         return quality_path
 
     audio_path = GENERATED_DIR / f"{prefix}-{audio_mode}-{uuid.uuid4().hex}.mp4"
     processed = process_audio(quality_path, audio_path, audio_mode)
-    if processed != quality_path and quality_path != source_path:
-        quality_path.unlink(missing_ok=True)
+    register_current_generated_asset(processed.name, metadata={"kind": "delivery", "quality": quality, "audio_mode": audio_mode})
     return processed

@@ -84,6 +84,10 @@ def initialize_billing_store() -> None:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_credit_workspace ON credit_ledger(workspace_id)"
             )
+            connection.execute("""CREATE TABLE IF NOT EXISTS generation_reservations (
+                reference TEXT PRIMARY KEY, workspace_id TEXT NOT NULL,
+                seconds INTEGER NOT NULL, state TEXT NOT NULL, attempt INTEGER NOT NULL
+            )""")
             connection.commit()
         _INITIALIZED = True
 
@@ -139,6 +143,25 @@ def _ledger(workspace_id: str, delta_seconds: int, reason: str, reference: str) 
             return False
 
 
+def _reservation(connection: sqlite3.Connection, workspace_id: str, reference: str):
+    row = connection.execute("SELECT * FROM generation_reservations WHERE reference=?", (reference,)).fetchone()
+    if row:
+        if row["workspace_id"] != workspace_id:
+            raise BillingError("Generation reservation belongs to another account.")
+        return row
+    # Existing ledgers remain usable through the reservation migration.
+    debit = connection.execute(
+        "SELECT * FROM credit_ledger WHERE reference=? AND workspace_id=? AND delta_seconds < 0",
+        (reference, workspace_id),
+    ).fetchone()
+    if debit:
+        refunded = connection.execute("SELECT 1 FROM credit_ledger WHERE reference=?", (f"refund:{reference}",)).fetchone()
+        connection.execute("INSERT INTO generation_reservations VALUES(?,?,?,?,0)",
+                           (reference, workspace_id, -debit["delta_seconds"], "refunded" if refunded else "charged"))
+        return connection.execute("SELECT * FROM generation_reservations WHERE reference=?", (reference,)).fetchone()
+    return None
+
+
 def consume_credits(workspace_id: str, seconds: int, reference: str) -> None:
     if not settings.billing_enforce_credits:
         return
@@ -146,36 +169,76 @@ def consume_credits(workspace_id: str, seconds: int, reference: str) -> None:
     initialize_billing_store()
     with _DB_LOCK, closing(_connect()) as connection:
         connection.execute("BEGIN IMMEDIATE")
-        existing = connection.execute(
-            "SELECT 1 FROM credit_ledger WHERE reference = ?", (reference,)
-        ).fetchone()
-        if existing:
-            connection.rollback()
+        existing = _reservation(connection, workspace_id, reference)
+        if existing and existing["state"] == "settled":
+            raise BillingError("This generation request has already completed. Start a new take.")
+        if existing and existing["state"] == "charged":
+            if existing["seconds"] != required:
+                raise BillingError("This generation request already reserved a different duration.")
+            connection.commit()
             return
-        row = connection.execute(
-            "SELECT COALESCE(SUM(delta_seconds), 0) AS balance FROM credit_ledger WHERE workspace_id = ?",
-            (workspace_id,),
-        ).fetchone()
-        balance = int(row["balance"] if row else 0)
+        balance = connection.execute(
+            "SELECT COALESCE(SUM(delta_seconds),0) FROM credit_ledger WHERE workspace_id=?", (workspace_id,)
+        ).fetchone()[0]
         if balance < required:
-            connection.rollback()
-            raise InsufficientCreditsError(
-                f"Insufficient generation credits. Need {required}s; balance is {balance}s."
-            )
+            raise InsufficientCreditsError(f"Insufficient generation credits. Need {required}s; balance is {balance}s.")
+        attempt = int(existing["attempt"]) + 1 if existing else 0
+        ledger_ref = reference if attempt == 0 else f"retry:{reference}:{attempt}"
         connection.execute(
-            """
-            INSERT INTO credit_ledger(workspace_id, delta_seconds, reason, reference, created_at)
-            VALUES (?, ?, 'generation', ?, ?)
-            """,
-            (workspace_id, -required, reference, _now()),
+            "INSERT INTO credit_ledger(workspace_id,delta_seconds,reason,reference,created_at) VALUES(?,?,'generation',?,?)",
+            (workspace_id, -required, ledger_ref, _now()),
+        )
+        connection.execute(
+            """INSERT INTO generation_reservations VALUES(?,?,?,'charged',?)
+            ON CONFLICT(reference) DO UPDATE SET seconds=excluded.seconds,state='charged',attempt=excluded.attempt""",
+            (reference, workspace_id, required, attempt),
         )
         connection.commit()
 
 
 def refund_credits(workspace_id: str, seconds: int, reference: str) -> None:
-    if not settings.billing_enforce_credits:
-        return
-    _ledger(workspace_id, max(1, int(seconds)), "generation_refund", f"refund:{reference}")
+    # Refund the recorded charge, never a caller-supplied amount or an uncharged
+    # request. Repeated failure callbacks and restart recovery are idempotent.
+    initialize_billing_store()
+    with _DB_LOCK, closing(_connect()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        reservation = _reservation(connection, workspace_id, reference)
+        if not reservation or reservation["state"] != "charged":
+            connection.commit()
+            return
+        attempt = int(reservation["attempt"])
+        ledger_ref = f"refund:{reference}" if attempt == 0 else f"refund:{reference}:{attempt}"
+        connection.execute(
+            "INSERT OR IGNORE INTO credit_ledger(workspace_id,delta_seconds,reason,reference,created_at) VALUES(?,?,'generation_refund',?,?)",
+            (workspace_id, reservation["seconds"], ledger_ref, _now()),
+        )
+        connection.execute("UPDATE generation_reservations SET state='refunded' WHERE reference=?", (reference,))
+        connection.commit()
+
+
+def settle_credits(workspace_id: str, reference: str) -> None:
+    initialize_billing_store()
+    with _DB_LOCK, closing(_connect()) as connection:
+        connection.execute(
+            "UPDATE generation_reservations SET state='settled' WHERE reference=? AND workspace_id=? AND state='charged'",
+            (reference, workspace_id),
+        )
+        connection.commit()
+
+
+def reconcile_orphaned_generation_charges(known_references: set[str]) -> None:
+    """Recover a crash between reserving credits and persisting the job row.
+
+    Called before request admission on the single-process application startup.
+    Only the new reservation records are reconciled; legacy completed debits
+    without reservation metadata must never be inferred to be orphaned.
+    """
+    initialize_billing_store()
+    with _DB_LOCK, closing(_connect()) as connection:
+        rows = connection.execute("SELECT * FROM generation_reservations WHERE state='charged'").fetchall()
+    for row in rows:
+        if row["reference"] not in known_references:
+            refund_credits(row["workspace_id"], row["seconds"], row["reference"])
 
 
 def catalog() -> list[dict]:

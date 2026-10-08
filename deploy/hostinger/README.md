@@ -93,6 +93,16 @@ APP_ENV="production"
 DEBUG=false
 FRONTEND_URL="https://devansh.info"
 CORS_ORIGINS=""
+AUTH_ENABLED=true
+DEMO_AUTH_SHOW_OTP=false
+TRIVEN_SECRET_KEY="use-a-random-secret-of-at-least-32-characters"
+SMTP_HOST="your-email-provider-host"
+SMTP_PORT=587
+SMTP_USERNAME="your-email-user"
+SMTP_PASSWORD="your-email-password"
+SMTP_FROM_EMAIL="your-verified-sender@example.com"
+SMTP_USE_TLS=true
+SMTP_USE_SSL=false
 VIDEO_PROVIDER="modal"
 GEMINI_API_KEY="..."
 MODAL_TOKEN_ID="..."
@@ -111,7 +121,11 @@ python3 scripts/production_preflight.py
 
 Fix every `[FAIL]` before deploying. The script expects host Nginx to own public 80/443.
 
+Production refuses demo OTP display, missing email configuration and short session-signing keys. SMTP delivery should be verified with your own account before launch. Preserve the existing signing key when it is already strong; changing it invalidates sessions and affects encrypted integrations.
+
 ## 6. Deploy application containers
+
+Deploy the compatible Modal worker in section 7 first. Application deployment calls its CPU preflight before replacing containers; an old worker or missing/inaccessible weights will stop rollout before GPU allocation.
 
 ```bash
 ./scripts/deploy_hostinger.sh
@@ -140,7 +154,13 @@ set +a
 modal deploy modal/app.py
 ```
 
-The long-video temporal-window patch does **not** require downloading LTX weights again.
+The reliability update adds the CPU `preflight` function (protocol version 2). Existing weights are reused; download only missing or incomplete model files. After worker deployment, verify all enabled recipes:
+
+```bash
+python scripts/check_inference.py --all
+```
+
+This validates model-file access, sizes and worker compatibility. It does not allocate a GPU or verify output quality.
 
 ## 8. Duration profiles
 
@@ -175,9 +195,29 @@ Enable Hostinger snapshots/backups as well. Local backups do not protect against
 
 ## 10. Updates
 
+### One-time migration for formerly tracked runtime files
+
+Before pulling the reliability update onto an existing server, wait for active jobs to finish, stop writes, and archive the live databases and uploaded references outside the repository. The old tracked SQLite files may have uncommitted production changes; archive them before stashing. Keep the archive until the deployment and account history are verified.
+
 ```bash
 cd ~/triven-cinema
-git pull
+docker compose -f docker-compose.production.yml stop api maintenance
+python3 scripts/backup_state.py
+TRIVEN_STATE_BACKUP="$HOME/triven-state-before-untracking-$(date +%Y%m%dT%H%M%S).tar.gz"
+tar -czf "$TRIVEN_STATE_BACKUP" storage/auth storage/chats storage/elements
+chmod 600 "$TRIVEN_STATE_BACKUP"
+git stash push -m "Runtime state before storage migration" -- storage/auth storage/chats storage/elements
+git pull --ff-only
+tar -xzf "$TRIVEN_STATE_BACKUP" -C .
+```
+
+Do not apply the runtime-state stash after the pull: restoring from the archive keeps those files untracked. If the pull fails, restore the archive before restarting the old application. Generated videos stay in the unchanged `storage/generated` bind mount. This sequence does not remove generated media.
+
+Configure the SMTP values above, refresh the Nginx template (it replaces untrusted forwarded IP headers for login rate limiting), deploy Modal separately, then rebuild the application:
+
+```bash
+cd ~/triven-cinema
+git pull --ff-only
 ./scripts/deploy_hostinger.sh
 ```
 

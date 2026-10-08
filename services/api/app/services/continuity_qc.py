@@ -3,7 +3,7 @@ import json
 import tempfile
 from pathlib import Path
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field
 
 from app.core.config import settings
 from app.schemas.generation import EntityLock
@@ -26,6 +26,7 @@ class ContinuityQCResult(BaseModel):
     note: str = ""
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     skipped: bool = False
+    not_checked: bool = False
 
 
 def _extract_json_text(payload: dict) -> str:
@@ -48,8 +49,8 @@ def _extract_json_text(payload: dict) -> str:
     return text
 
 
-def _skipped(note: str) -> ContinuityQCResult:
-    return ContinuityQCResult(passed=True, skipped=True, note=note, confidence=0.0)
+def _skipped(note: str, *, not_checked: bool = False) -> ContinuityQCResult:
+    return ContinuityQCResult(passed=False, skipped=True, not_checked=not_checked, note=note, confidence=0.0)
 
 
 def _image_part(path: Path) -> dict:
@@ -85,9 +86,9 @@ def evaluate_scene_cardinality(
     continuity: "how many?" and "is this still the same character?".
     """
     if qc_mode == "off":
-        return _skipped("Continuity vision QC disabled for this request.")
+        return _skipped("Continuity vision QC disabled for this request.", not_checked=True)
     if not settings.continuity_vision_qc_enabled:
-        return _skipped("Continuity vision QC is disabled by deployment configuration.")
+        return _skipped("Continuity vision QC is disabled by deployment configuration.", not_checked=True)
     if not settings.gemini_api_key:
         return _skipped("Gemini is not configured; prompt/cardinality guard remains active.")
 
@@ -172,41 +173,49 @@ Return ONLY JSON with exactly this shape:
 }}
 """.strip()
 
-    with tempfile.TemporaryDirectory(prefix=".triven-qc-", dir=video_path.parent) as tmp:
-        frames = extract_qc_frames(
-            video_path,
-            Path(tmp),
-            prefix="continuity-qc",
-            positions=(0.02, 0.18, 0.45, 0.72, 0.94)[: max(1, min(5, settings.continuity_qc_max_frames))],
-        )
-        if not frames:
-            return _skipped("No QC frames could be extracted from the generated clip.")
+    try:
+        with tempfile.TemporaryDirectory(prefix=".triven-qc-", dir=video_path.parent) as tmp:
+            frames = extract_qc_frames(
+                video_path,
+                Path(tmp),
+                prefix="continuity-qc",
+                positions=(0.02, 0.18, 0.45, 0.72, 0.94)[: max(1, min(5, settings.continuity_qc_max_frames))],
+            )
+            if not frames:
+                return _skipped("No QC frames could be extracted from the generated clip.")
 
-        parts: list[dict] = [{"text": prompt}]
-        if canonical_refs:
-            parts.append({"text": "CANONICAL ELEMENT REFERENCES:"})
-            for label, path in canonical_refs:
-                parts.append({"text": f"CANONICAL {label}:"})
-                parts.append(_image_part(path))
-        if has_reference and reference_frame_path is not None:
-            parts.append({"text": "PREVIOUS APPROVED CONTINUITY REFERENCE:"})
-            parts.append(_image_part(reference_frame_path))
-        if canonical_refs or has_reference:
-            parts.append({"text": "GENERATED CLIP SAMPLES:"})
-        for sample_index, frame in enumerate(frames, start=1):
-            parts.append({"text": f"GENERATED CLIP SAMPLE {sample_index}/{len(frames)} — judge actual video defects in this image only:"})
-            parts.append(_image_part(frame))
+            parts: list[dict] = [{"text": prompt}]
+            if canonical_refs:
+                parts.append({"text": "CANONICAL ELEMENT REFERENCES:"})
+                for label, path in canonical_refs:
+                    parts.append({"text": f"CANONICAL {label}:"})
+                    parts.append(_image_part(path))
+            if has_reference and reference_frame_path is not None:
+                parts.append({"text": "PREVIOUS APPROVED CONTINUITY REFERENCE:"})
+                parts.append(_image_part(reference_frame_path))
+            if canonical_refs or has_reference:
+                parts.append({"text": "GENERATED CLIP SAMPLES:"})
+            for sample_index, frame in enumerate(frames, start=1):
+                parts.append({"text": f"GENERATED CLIP SAMPLE {sample_index}/{len(frames)} — judge actual video defects in this image only:"})
+                parts.append(_image_part(frame))
 
-        try:
             response = generate_content(
                 parts=parts,
                 max_output_tokens=1400,
                 timeout_seconds=settings.continuity_qc_timeout_seconds,
                 thinking_level="low",
             )
-            parsed = ContinuityQCResult.model_validate_json(_extract_json_text(response.payload))
-        except (RuntimeError, ValueError, json.JSONDecodeError, ValidationError) as exc:
-            return _skipped(f"Continuity vision QC unavailable ({str(exc)[:180]}). Prompt guard remains active.")
+            payload = json.loads(_extract_json_text(response.payload))
+            required = {"passed", "duplicate_detected", "identity_drift_detected", "artifact_detected",
+                        "wardrobe_mismatch_detected", "violations", "identity_violations",
+                        "artifact_violations", "wardrobe_violations", "note", "confidence"}
+            if not isinstance(payload, dict) or not required.issubset(payload):
+                raise ValueError("QC provider returned an incomplete verdict.")
+            parsed = ContinuityQCResult.model_validate(payload, strict=True)
+            if parsed.skipped or parsed.not_checked or not parsed.note.strip() or parsed.confidence <= 0:
+                raise ValueError("QC provider returned an unverified verdict.")
+    except Exception as exc:
+        return _skipped(f"Continuity vision QC unavailable ({type(exc).__name__}: {str(exc)[:140]}).")
 
     # Never trust a model-produced pass if the same payload reports a hard violation.
     if (

@@ -1,5 +1,8 @@
 import importlib.util
 import sys
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -17,6 +20,20 @@ spec.loader.exec_module(retake_worker)
 
 
 class ModalRetakeWorkerTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg required")
+    def test_audio_repair_keeps_original_video_packets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source, repaired, output = [Path(tmp) / name for name in ("source.mp4", "repaired.mp4", "output.mp4")]
+            for path, color, tone in [(source, "red", "440"), (repaired, "blue", "880")]:
+                subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", f"color=c={color}:s=64x64:r=24:d=1", "-f", "lavfi", "-i", f"sine=frequency={tone}:duration=1", "-c:v", "libx264", "-c:a", "aac", "-shortest", str(path)], check=True, capture_output=True)
+            subprocess.run(retake_worker.build_audio_retake_mux_command(source, repaired, output), check=True, capture_output=True)
+            def stream_hash(path, stream):
+                return subprocess.check_output(["ffmpeg", "-v", "error", "-i", str(path), "-map", stream, "-c", "copy", "-f", "hash", "-hash", "sha256", "-"]).strip()
+            self.assertEqual(stream_hash(source, "0:v:0"), stream_hash(output, "0:v:0"))
+            self.assertEqual(stream_hash(repaired, "0:a:0"), stream_hash(output, "0:a:0"))
+            self.assertNotEqual(stream_hash(source, "0:a:0"), stream_hash(output, "0:a:0"))
+            self.assertTrue(source.exists())
+
     def test_retake_command_uses_ltx_virtualenv_python(self):
         command = retake_worker.build_retake_subprocess_command(
             input_path=Path("/tmp/in.mp4"),

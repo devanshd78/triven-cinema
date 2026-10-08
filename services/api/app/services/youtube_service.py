@@ -433,6 +433,9 @@ def upload_video(
     publish_at: str | None = None,
 ) -> dict:
     _require_enabled()
+    from app.services.job_service import workspace_owns_generated_file
+    if not workspace_owns_generated_file(workspace_id, filename):
+        raise YouTubeIntegrationError("Video not found in this account.")
     video_path = resolve_generated_asset(filename, extensions={".mp4"})
     refresh_token = _refresh_token_for(workspace_id)
     access_token = _refresh_access_token(refresh_token)

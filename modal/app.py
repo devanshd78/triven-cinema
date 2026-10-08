@@ -1,5 +1,6 @@
 import os
 import re
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -16,7 +17,7 @@ from ltx_worker import (
     static_reference_frame_count,
     temporal_chunk_count,
 )
-from models import DETAILING_LORA, INGREDIENTS_LORA, MODEL_ROOT, REFINE_DETAILS_LORA, REQUIRED_MODEL_FILES
+from models import DETAILING_LORA, INGREDIENTS_LORA, MODEL_ROOT, REFINE_DETAILS_LORA, REQUIRED_MODEL_FILES, required_model_paths, check_model_file_access
 from retake_worker import retake_audio_only
 
 
@@ -111,6 +112,37 @@ def _missing_base_models() -> list[str]:
     return [path for path in REQUIRED_MODEL_FILES if not (MODEL_ROOT / path).exists()]
 
 
+@app.function(image=image, secrets=[hf_secret], volumes={"/models": models_volume}, timeout=120)
+def preflight(render_mode: str = "distilled", realism_profile: str = "standard", element_reference_required: bool = False, operation: str = "generate", decoder: str = "conv") -> dict:
+    """CPU-only manifest check; never allocate a GPU to discover missing weights."""
+    models_volume.reload()
+    paths = required_model_paths(render_mode=render_mode, realism_profile=realism_profile,
+                                 element_reference_required=element_reference_required, operation=operation, decoder=decoder)
+    errors = []
+    missing = [str(path.relative_to(MODEL_ROOT)) for path in paths if not path.is_file() or path.stat().st_size == 0]
+    if missing:
+        errors.append("Missing or empty model files: " + ", ".join(missing) + ". Run `modal run modal/app.py::download_models`.")
+    interpreter = Path("/opt/LTX-2/.venv/bin/python")
+    if not interpreter.is_file():
+        errors.append("LTX Python environment is missing; redeploy `modal deploy modal/app.py`.")
+    else:
+        check = subprocess.run([str(interpreter), "-c", "import importlib.util; assert all(importlib.util.find_spec(m) for m in ['torch','ltx_pipelines.ic_lora','ltx_pipelines.retake','ltx_pipelines.dfr_pipeline']), 'Required LTX modules missing'"], capture_output=True, text=True, timeout=45)
+        if check.returncode:
+            errors.append("Worker package compatibility check failed; redeploy the pinned LTX image. " + check.stderr[-500:])
+    if not GPU_TYPE.strip():
+        errors.append("TRIVEN_MODAL_GPU is empty; configure a Modal GPU and redeploy.")
+    # Inference can use cached weights, but validate model access before accepting a
+    # deployment as ready so recovery/downloads do not fail after a job is queued.
+    token = os.environ.get("HF_TOKEN")
+    if not token:
+        errors.append("HF_TOKEN is missing from the Modal secret `huggingface-secret`.")
+    else:
+        errors.extend(check_model_file_access(paths, token))
+    return {"ready": not errors, "supported": True, "protocol_version": 2, "ltx_repo_ref": LTX_REPO_REF,
+            "gpu": GPU_TYPE, "operation": operation, "required_models": [str(p.relative_to(MODEL_ROOT)) for p in paths],
+            "missing_models": missing, "errors": errors}
+
+
 @app.function(
     image=image,
     gpu=GPU_TYPE,
@@ -137,18 +169,12 @@ def generate_video(
 ) -> dict:
     del enhance_prompt  # Prompt enhancement currently happens in Triven/Gemini.
 
-    missing = _missing_base_models()
     mode = (render_mode or "distilled").strip().lower()
     realism = (realism_profile or "standard").strip().lower()
     if realism not in {"standard", "real_skin", "identity_max"}:
         raise ValueError(f"Unsupported realism profile: {realism_profile}")
     apply_detail_refiner = mode == "dfr" and realism in {"real_skin", "identity_max"}
-    if mode == "dfr" and not DETAILING_LORA.exists():
-        missing.append(str(DETAILING_LORA.relative_to(MODEL_ROOT)))
-    if element_reference_sheet_bytes and not INGREDIENTS_LORA.exists():
-        missing.append(str(INGREDIENTS_LORA.relative_to(MODEL_ROOT)))
-    if apply_detail_refiner and not REFINE_DETAILS_LORA.exists():
-        missing.append(str(REFINE_DETAILS_LORA.relative_to(MODEL_ROOT)))
+    missing = [str(path.relative_to(MODEL_ROOT)) for path in required_model_paths(render_mode=mode, realism_profile=realism, element_reference_required=bool(element_reference_sheet_bytes), decoder=decoder) if not path.is_file() or path.stat().st_size == 0]
     if missing:
         raise RuntimeError(
             "LTX-2.5 model files are missing. Run `modal run modal/app.py::download_models` "
@@ -159,6 +185,8 @@ def generate_video(
     output_path = Path("/tmp") / f"ltx-{uuid.uuid4().hex}.mp4"
     base_output_path = output_path if not apply_detail_refiner else Path("/tmp") / f"ltx-base-{uuid.uuid4().hex}.mp4"
     refined_picture_path = None if not apply_detail_refiner else Path("/tmp") / f"ltx-refined-{uuid.uuid4().hex}.mp4"
+    detail_refined = False
+    refinement_warning = ""
 
     reference_path: Path | None = None
     element_sheet_path: Path | None = None
@@ -200,20 +228,29 @@ def generate_video(
         run_ltx_command(command)
         if apply_detail_refiner:
             assert refined_picture_path is not None
-            refine_command = build_refine_details_command(
-                input_video_path=base_output_path,
-                output_path=refined_picture_path,
-                width=width,
-                height=height,
-                duration_seconds=duration_seconds,
-                seed=seed + 97_531,
-            )
-            run_ltx_command(refine_command)
-            preserve_source_audio(
-                refined_video_path=refined_picture_path,
-                source_video_path=base_output_path,
-                output_path=output_path,
-            )
+            try:
+                refine_command = build_refine_details_command(
+                    input_video_path=base_output_path,
+                    output_path=refined_picture_path,
+                    width=width,
+                    height=height,
+                    duration_seconds=duration_seconds,
+                    seed=seed + 97_531,
+                )
+                run_ltx_command(refine_command)
+                preserve_source_audio(
+                    refined_video_path=refined_picture_path,
+                    source_video_path=base_output_path,
+                    output_path=output_path,
+                )
+                detail_refined = True
+            except Exception as exc:
+                # Refinement is optional: a successful base render is a deliverable.
+                # Return the existing file directly, without a second large copy
+                # that could fail when disk space was the refinement failure.
+                output_path.unlink(missing_ok=True)
+                output_path = base_output_path
+                refinement_warning = f"Refinement unavailable; base render preserved ({type(exc).__name__}: {str(exc)[:300]})"
     finally:
         if reference_path is not None:
             reference_path.unlink(missing_ok=True)
@@ -221,10 +258,10 @@ def generate_video(
             element_sheet_path.unlink(missing_ok=True)
         if element_reference_video_path is not None:
             element_reference_video_path.unlink(missing_ok=True)
-        if apply_detail_refiner:
+        if apply_detail_refiner and output_path != base_output_path and output_path.exists() and output_path.stat().st_size:
             base_output_path.unlink(missing_ok=True)
-            if refined_picture_path is not None:
-                refined_picture_path.unlink(missing_ok=True)
+        if refined_picture_path is not None:
+            refined_picture_path.unlink(missing_ok=True)
 
     if not output_path.exists():
         raise RuntimeError("LTX finished without producing an MP4 file.")
@@ -247,11 +284,12 @@ def generate_video(
             + f" · {('diffusion' if mode == 'dfr' else decoder)} decoder · {GPU_TYPE}"
             + (
                 " · Refine Details IC-LoRA · tiled texture pass · source audio preserved"
-                if apply_detail_refiner
+                if detail_refined
                 else ""
             )
             + (" · Identity Max" if realism == "identity_max" else (" · Real Skin" if realism == "real_skin" else ""))
             + (" · first-frame continuity" if reference_image_bytes else "")
+            + (f" · WARNING: {refinement_warning}" if refinement_warning else "")
         ),
         "render_seconds": elapsed,
         "gpu": GPU_TYPE,
@@ -263,7 +301,8 @@ def generate_video(
         ),
         "render_mode": "ingredients" if element_reference_sheet_bytes else mode,
         "realism_profile": realism,
-        "detail_refined": apply_detail_refiner,
+        "detail_refined": detail_refined,
+        "warnings": [refinement_warning] if refinement_warning else [],
     }
 
 
@@ -282,7 +321,8 @@ def retake_audio(
     seed: int = 42,
 ) -> dict:
     """Regenerate only the LTX audio stream while freezing the source video."""
-    missing = _missing_base_models()
+    missing = [str(path.relative_to(MODEL_ROOT)) for path in required_model_paths(operation="retake_audio")
+               if not path.is_file() or path.stat().st_size == 0]
     if missing:
         raise RuntimeError(
             "LTX-2.5 model files are missing. Run `modal run modal/app.py::download_models`. "

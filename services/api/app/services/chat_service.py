@@ -112,10 +112,11 @@ def save_chat(
             """
             INSERT INTO studio_chats(id, workspace_id, title, workspace_json, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(workspace_id, id) DO UPDATE SET
+                ON CONFLICT(workspace_id, id) DO UPDATE SET
                 title = excluded.title,
                 workspace_json = excluded.workspace_json,
-                updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at
+                WHERE excluded.updated_at >= studio_chats.updated_at
             """,
             (chat_id, workspace_id, clean_title, workspace_json, created, updated),
         )

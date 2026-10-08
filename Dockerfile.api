@@ -19,6 +19,7 @@ COPY video /app/video
 COPY modal /app/modal
 COPY scripts/cleanup_storage.py /app/scripts/cleanup_storage.py
 COPY scripts/backup_state.py /app/scripts/backup_state.py
+COPY scripts/check_inference.py /app/scripts/check_inference.py
 RUN mkdir -p /app/storage/generated /app/storage/metrics /app/storage/jobs /app/storage/billing /app/storage/integrations /app/storage/backups /app/storage/logs
 
 EXPOSE 8000

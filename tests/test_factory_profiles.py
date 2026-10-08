@@ -98,7 +98,7 @@ class FactoryProfileTests(unittest.TestCase):
 
     def test_qc_provider_outage_can_be_configured_fail_closed(self):
         with patch.object(settings, "factory_qc_fail_open_on_unavailable", False):
-            self.assertTrue(_qc_unavailable_is_fatal(True))
+            self.assertFalse(_qc_unavailable_is_fatal(True))
             self.assertFalse(_qc_unavailable_is_fatal(False))
 
     def test_factory_uses_distinct_deterministic_seed_per_scene(self):
@@ -134,7 +134,8 @@ class FactoryProfileTests(unittest.TestCase):
         scene_prompt = plan.scenes[0].prompt.lower()
         self.assertIn("cable-knit sweater", scene_prompt)
         self.assertIn("white and soft lavender", scene_prompt)
-        self.assertIn("hey everyone", scene_prompt)
+        self.assertIn("hey everyone", plan.scenes[0].spoken_script.lower())
+        self.assertNotIn("hey everyone", scene_prompt)
         self.assertIn("visible pores", scene_prompt)
         self.assertEqual(plan.scenes[0].duration_seconds, 30)
 

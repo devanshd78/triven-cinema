@@ -85,7 +85,8 @@ def generate_content(
                 last_error = f"Gemini {model} request timed out."
                 retryable = True
             except httpx.HTTPError as exc:
-                last_error = f"Gemini {model} request failed: {str(exc)[:180]}"
+                # HTTP exception strings may contain the request URL/API key.
+                last_error = f"Gemini {model} connection failed ({type(exc).__name__})."
                 retryable = True
             else:
                 if response.status_code == 200:

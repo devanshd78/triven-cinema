@@ -20,6 +20,9 @@ from app.schemas.youtube import YouTubePrivacy
 
 
 class FactoryGenerationRequest(BaseModel):
+    spoken_script: str = Field(default="", max_length=50000)
+    request_id: str | None = Field(default=None, max_length=128)
+    chat_id: str | None = Field(default=None, max_length=128)
     prompt: str = Field(..., min_length=10, max_length=50000)
     target_duration_seconds: float = Field(default=30.0, ge=15.0, le=300.0)
     scene_duration_seconds: float = Field(default=20.0, ge=15.0, le=30.0)
@@ -98,6 +101,9 @@ class FactoryGenerationResponse(BaseModel):
     audio_qc_status: QualityCheckStatus = "not_checked"
     audio_retake_count: int = 0
     audio_warnings: list[str] = Field(default_factory=list)
+    delivery_complete: bool = True
+    scene_results: list[dict] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
     elements_used: list[str] = Field(default_factory=list)
     element_reference_mode: str | None = None
     youtube_video_id: str | None = None

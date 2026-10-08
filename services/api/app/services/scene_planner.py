@@ -14,6 +14,7 @@ from app.services.continuity_service import (
     local_style_bible,
 )
 from app.services.gemini_service import generate_content
+from app.services.dialogue_service import separate_visual_and_script, split_spoken_script
 
 
 class EntityLockDraft(BaseModel):
@@ -63,6 +64,13 @@ class ScenePlanResult:
     note: str | None = None
 
 
+def _assign_spoken_script(scenes: list[Scene], script: str) -> list[Scene]:
+    scripts = split_spoken_script(script, len(scenes))
+    return [scene.model_copy(update={"spoken_script": line,
+                                    "prompt": separate_visual_and_script(scene.prompt)[0]})
+            for scene, line in zip(scenes, scripts)]
+
+
 def _compact(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
@@ -96,6 +104,7 @@ def _locked_scenes(
                 visible_entity_counts=scene.visible_entity_counts,
             ),
             duration_seconds=scene.duration_seconds,
+            spoken_script=scene.spoken_script,
             visible_entity_counts=scene.visible_entity_counts,
         )
         for index, scene in enumerate(scenes)
@@ -471,10 +480,7 @@ SCENE RULES:
 - Avoid morph transitions through bodies. Prefer natural cuts, camera movement, match cuts, scenery dissolves or environmental transitions.
 - Reject AI-looking construction in the plan itself: no unexplained extra straps/buttons/zippers, duplicated props, warped hands, invented text/signage, or unstable set geometry.
 - Do not place two copies of the same named identity in one frame unless the manuscript explicitly requests a duplicate.
-- AUDIO DIRECTION must be chronological and concise. Do not invent speech.
-- If dialogue is requested, include ONLY the exact short line(s) spoken in this shot, in quotes, with the correct speaker.
-- Do not stuff multiple paragraphs of narration/dialogue into a {target_duration_seconds}s shot.
-- If long narration exists, select only the words that can naturally fit this shot; preserve chronology.
+- Dialogue is managed separately as an immutable user script. Do not invent, quote, summarize or rewrite speech in visual scene prompts.
 - No fake Hindi/Sanskrit, random singing, mumbling, speech-like ambience, subtitles, logos or watermarks.
 - Do not mention output resolution.
 - Do not include any explanation outside the JSON object.
@@ -540,6 +546,7 @@ def create_prompt_only_plan(
     scene_count: int,
     *,
     target_scene_duration_seconds: float | None = None,
+    spoken_script: str = "",
 ) -> ScenePlanResult:
     """Create a chronological Factory plan without Gemini or creative rewriting.
 
@@ -549,7 +556,7 @@ def create_prompt_only_plan(
     orchestration, not enhancement: no new plot, dialogue, character traits or
     visual ideas are invented here.
     """
-    clean_prompt = prompt.strip()
+    clean_prompt, script = separate_visual_and_script(prompt, spoken_script)
     target_duration = max(3, min(30, int(round(target_scene_duration_seconds or 5))))
     character_bible = local_character_bible(clean_prompt)
     style_bible = local_style_bible(clean_prompt)
@@ -586,7 +593,7 @@ def create_prompt_only_plan(
             )
         )
     return ScenePlanResult(
-        scenes=scenes,
+        scenes=_assign_spoken_script(scenes, script),
         source="direct",
         character_bible=character_bible,
         style_bible=style_bible,
@@ -606,11 +613,12 @@ def create_scene_plan(
     *,
     force_ai: bool = False,
     target_scene_duration_seconds: float | None = None,
+    spoken_script: str = "",
 ) -> ScenePlanResult:
     # Preserve headings, dialogue boundaries and paragraph structure for Gemini.
     # The previous implementation collapsed the full manuscript to one line before
     # planning, which made screenplay structure much harder to recover.
-    clean_prompt = prompt.strip()
+    clean_prompt, script = separate_visual_and_script(prompt, spoken_script)
     target_duration = max(3, min(30, int(round(target_scene_duration_seconds or 5))))
 
     if scene_count == 1 and not force_ai:
@@ -618,7 +626,7 @@ def create_scene_plan(
             clean_prompt, 1, target_duration_seconds=target_duration
         )
         return ScenePlanResult(
-            scenes=scenes,
+            scenes=_assign_spoken_script(scenes, script),
             source="direct",
             character_bible=character_bible,
             style_bible=style_bible,
@@ -634,7 +642,7 @@ def create_scene_plan(
             target_duration_seconds=target_duration,
         )
         return ScenePlanResult(
-            scenes=scenes,
+            scenes=_assign_spoken_script(scenes, script),
             source="gemini",
             character_bible=character_bible,
             style_bible=style_bible,
@@ -646,7 +654,7 @@ def create_scene_plan(
             clean_prompt, scene_count, target_duration_seconds=target_duration
         )
         return ScenePlanResult(
-            scenes=scenes,
+            scenes=_assign_spoken_script(scenes, script),
             source="fallback",
             character_bible=character_bible,
             style_bible=style_bible,

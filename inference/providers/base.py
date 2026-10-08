@@ -26,6 +26,11 @@ class VideoProvider(ABC):
     supports_native_long_video: bool = False
     supports_audio_retake: bool = False
 
+    def preflight(self, **kwargs) -> dict:
+        """Explicitly report when a provider cannot inspect remote readiness."""
+        return {"ready": False, "provider": self.name, "supported": False,
+                "errors": ["This provider does not expose an inference readiness check."]}
+
     @abstractmethod
     def generate(
         self,

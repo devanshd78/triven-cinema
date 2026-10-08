@@ -64,6 +64,27 @@ class _LegacyIngredientsModalProvider(VideoProvider):
 
 
 class LongRenderServiceTests(unittest.TestCase):
+    def test_completed_chunks_survive_and_are_registered_when_later_render_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            provider = _LegacyIngredientsModalProvider(root)
+            original = provider.generate
+            def fail_second_chunk(**kwargs):
+                if len(provider.calls) >= 2:
+                    raise RuntimeError("second chunk failed")
+                return original(**kwargs)
+            provider.generate = fail_second_chunk
+            with (
+                patch("app.services.long_render_service.GENERATED_DIR", root),
+                patch("app.services.long_render_service.register_current_generated_asset") as register,
+                patch("app.services.long_render_service.extract_last_frame", side_effect=lambda _source, target: target.write_bytes(b"frame")),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "second chunk failed"):
+                    render_long_clip(provider=provider, prompt="presenter", width=512, height=512,
+                                     duration_seconds=30, seed=42, decoder="conv", element_reference_sheet_path="sheet.png")
+                self.assertEqual(register.call_args.args[0], "chunk-2.mp4")
+                self.assertTrue((root / "chunk-2.mp4").exists())
+
     def test_thirty_seconds_uses_three_ten_second_chunks(self):
         self.assertEqual(split_duration(30, 10), [10.0, 10.0, 10.0])
 

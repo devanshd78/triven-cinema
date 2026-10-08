@@ -39,6 +39,7 @@ class PlanQualityReport(BaseModel):
 
 
 class ScenePlanRequest(BaseModel):
+    spoken_script: str = Field(default="", max_length=50000)
     prompt: str = Field(..., min_length=3, max_length=50000)
     aspect_ratio: AspectRatio = "16:9"
     scene_count: int = Field(default=4, ge=1, le=20)
@@ -51,6 +52,7 @@ class EntityLock(BaseModel):
 
 
 class Scene(BaseModel):
+    spoken_script: str = ""
     id: int
     title: str
     prompt: str
@@ -74,6 +76,9 @@ class ScenePlanResponse(BaseModel):
 
 
 class VideoGenerationRequest(BaseModel):
+    spoken_script: str = Field(default="", max_length=50000)
+    request_id: str | None = Field(default=None, max_length=128)
+    chat_id: str | None = Field(default=None, max_length=128)
     prompt: str = Field(..., min_length=10, max_length=8000)
     aspect_ratio: AspectRatio = "16:9"
     duration_seconds: float = Field(default=5.0, ge=1.0, le=30.0)
@@ -118,6 +123,7 @@ class MediaInfo(BaseModel):
 
 
 class VideoGenerationResponse(BaseModel):
+    delivery_complete: bool = True
     video_url: str
     download_url: str
     filename: str
@@ -147,11 +153,20 @@ class VideoGenerationResponse(BaseModel):
     visual_qc_status: QualityCheckStatus = "not_checked"
     continuity_regenerations: int = 0
     continuity_warnings: list[str] = Field(default_factory=list)
+    audio_qc_passed: bool | None = None
+    audio_qc_status: QualityCheckStatus = "not_checked"
+    audio_retake_count: int = 0
+    audio_warnings: list[str] = Field(default_factory=list)
+    visual_qc: dict | None = None
+    audio_qc: dict | None = None
+    scene_results: list[dict] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
     elements_used: list[str] = Field(default_factory=list)
     element_reference_mode: str | None = None
 
 
 class FullVideoScene(BaseModel):
+    spoken_script: str = Field(default="", max_length=50000)
     id: int
     prompt: str = Field(..., min_length=10, max_length=8000)
     visible_entity_counts: dict[str, int] = Field(default_factory=dict)
@@ -182,6 +197,10 @@ class FullVideoGenerationRequest(BaseModel):
 
 
 class FullVideoGenerationResponse(BaseModel):
+    visual_qc_status: QualityCheckStatus = "not_checked"
+    audio_qc_status: QualityCheckStatus = "not_checked"
+    scene_results: list[dict] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
     final_video_url: str
     final_download_url: str
     final_filename: str
@@ -204,6 +223,8 @@ class FullVideoGenerationResponse(BaseModel):
 
 
 class CombineScenesRequest(BaseModel):
+    request_id: str | None = Field(default=None, max_length=128)
+    chat_id: str | None = Field(default=None, max_length=128)
     scene_video_urls: list[str] = Field(..., min_length=1, max_length=50)
     aspect_ratio: AspectRatio = "16:9"
     quality: RenderQuality = "preview"
@@ -211,6 +232,11 @@ class CombineScenesRequest(BaseModel):
 
 
 class CombineScenesResponse(BaseModel):
+    delivery_complete: bool = True
+    visual_qc_status: QualityCheckStatus = "not_checked"
+    audio_qc_status: QualityCheckStatus = "not_checked"
+    scene_results: list[dict] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
     final_video_url: str
     final_download_url: str
     final_filename: str
@@ -262,6 +288,9 @@ class GenerationJobResponse(BaseModel):
     message: str
     payload: dict
     result: dict | None = None
+    assets: list[dict] = Field(default_factory=list)
+    request_id: str | None = None
+    chat_id: str | None = None
     error: str | None = None
     created_at: str
     updated_at: str
@@ -274,3 +303,12 @@ class MetricsSummaryResponse(BaseModel):
     average_render_seconds: float | None = None
     average_estimated_cost_usd: float | None = None
     by_gpu: dict[str, dict]
+
+
+class AudioRetakeRequest(BaseModel):
+    filename: str = Field(..., min_length=1, max_length=255)
+    spoken_script: str = Field(default="", max_length=50000)
+    audio_direction: str | None = Field(default=None, max_length=1200)
+    seed: int = Field(default=42, ge=0, le=2_147_483_647)
+    request_id: str | None = Field(default=None, max_length=128)
+    chat_id: str | None = Field(default=None, max_length=128)

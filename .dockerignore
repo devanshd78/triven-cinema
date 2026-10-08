@@ -12,6 +12,9 @@ storage/jobs
 storage/metrics
 storage/benchmarks
 .DS_Store
+storage
+*.orig
+*.rej
 
 storage/logs
 

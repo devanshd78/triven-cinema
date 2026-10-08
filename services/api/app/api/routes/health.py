@@ -4,6 +4,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 
 from app.core.config import settings
+from app.services.auth_service import AuthError, validate_auth_configuration
 
 
 router = APIRouter()
@@ -38,6 +39,11 @@ async def health_check():
 
 @router.get("/ready")
 async def readiness_check():
+    try:
+        validate_auth_configuration()
+        auth_ready = True
+    except AuthError:
+        auth_ready = False
     free_gb = _disk_free_gb()
     checks = {
         "storage_writable": _storage_writable(),
@@ -48,12 +54,15 @@ async def readiness_check():
         "provider": settings.video_provider,
         "gemini_configured": bool(settings.gemini_api_key),
         "modal_config_present": bool(settings.modal_app_name and settings.modal_function_name),
+        "authentication_configured": auth_ready,
+        "inference_check": "Run scripts/check_inference.py; provider preflight also runs before every GPU request.",
     }
     ready = bool(
         checks["storage_writable"]
         and checks["ffmpeg"]
         and checks["ffprobe"]
         and checks["disk_ok"]
+        and checks["authentication_configured"]
     )
     payload = {
         "status": "ready" if ready else "not_ready",

@@ -91,12 +91,14 @@ export interface Scene {
   id: number;
   title: string;
   prompt: string;
+  spoken_script?: string;
   duration_seconds: number;
   visible_entity_counts: Record<string, number>;
 }
 
 export interface ScenePlanRequest {
   prompt: string;
+  spoken_script?: string;
   aspect_ratio: AspectRatio;
   scene_count: number;
 }
@@ -116,6 +118,9 @@ export interface ScenePlanResponse {
 
 export interface VideoGenerationRequest {
   prompt: string;
+  spoken_script?: string;
+  request_id?: string;
+  chat_id?: string;
   aspect_ratio: AspectRatio;
   duration_seconds: number;
   seed: number;
@@ -182,6 +187,14 @@ export interface VideoGenerationResponse {
   continuity_frame_filename: string | null;
   continuity_qc_passed: boolean | null;
   visual_qc_status?: QualityCheckStatus;
+  audio_qc_status?: QualityCheckStatus;
+  audio_qc_passed?: boolean | null;
+  audio_warnings?: string[];
+  audio_retake_count?: number;
+  visual_qc?: Record<string, unknown>;
+  audio_qc?: Record<string, unknown>;
+  warnings?: string[];
+  delivery_complete?: boolean;
   continuity_regenerations: number;
   continuity_warnings: string[];
   elements_used: string[];
@@ -241,6 +254,8 @@ export interface FullVideoGenerationResponse {
 }
 
 export interface CombineScenesRequest {
+  request_id?: string;
+  chat_id?: string;
   scene_video_urls: string[];
   aspect_ratio: AspectRatio;
   quality: RenderQuality;
@@ -248,6 +263,9 @@ export interface CombineScenesRequest {
 }
 
 export interface CombineScenesResponse {
+  visual_qc_status?: QualityCheckStatus;
+  audio_qc_status?: QualityCheckStatus;
+  warnings?: string[];
   final_video_url: string;
   final_download_url: string;
   final_filename: string;
@@ -256,6 +274,28 @@ export interface CombineScenesResponse {
   quality_note: string;
   audio_mode: AudioMode;
   media_info: MediaInfo;
+}
+
+export interface AudioRetakeRequest {
+  filename: string;
+  spoken_script: string;
+  audio_direction?: string | null;
+  seed?: number;
+  request_id?: string;
+  chat_id?: string;
+}
+
+export interface AudioRetakeResponse {
+  filename: string;
+  video_url: string;
+  download_url: string;
+  media_info: MediaInfo;
+  visual_qc_status?: QualityCheckStatus;
+  audio_qc_status?: QualityCheckStatus;
+  audio_qc_passed?: boolean | null;
+  audio_warnings?: string[];
+  audio_retake_count?: number;
+  visual_qc?: Record<string, unknown>;
 }
 
 export interface GenerationCapabilitiesResponse {
@@ -299,6 +339,7 @@ export interface GenerationCapabilitiesResponse {
     ingredients_enabled: boolean;
     max_stored: number;
     max_assets_per_element: number;
+    max_upload_mb?: number;
     max_active_per_scene: number;
     max_characters_per_scene: number;
     max_props_per_scene: number;
@@ -316,6 +357,8 @@ export interface AsyncVideoGenerationResponse {
 
 export interface GenerationJobResponse {
   job_id: string;
+  chat_id?: string | null;
+  request_id?: string | null;
   job_type: string;
   status: JobStatusName;
   stage: JobStageName;
@@ -326,6 +369,7 @@ export interface GenerationJobResponse {
   error: string | null;
   created_at: string;
   updated_at: string;
+  assets?: Array<{ filename: string; video_url?: string; download_url?: string; kind?: string; visual_qc_status?: QualityCheckStatus; audio_qc_status?: QualityCheckStatus; metadata?: { visual_qc_status?: QualityCheckStatus; audio_qc_status?: QualityCheckStatus; [key: string]: unknown }; [key: string]: unknown }>;
 }
 
 export interface MetricsSummaryResponse {
@@ -341,6 +385,7 @@ export interface MetricsSummaryResponse {
 }
 
 export interface RenderedSceneVideo {
+  renderSignature?: string;
   url: string;
   downloadUrl: string;
   filename: string;
@@ -363,6 +408,8 @@ export interface RenderedSceneVideo {
   continuityFrameFilename: string | null;
   continuityQcPassed: boolean | null;
   visualQcStatus?: QualityCheckStatus;
+  audioQcStatus?: QualityCheckStatus;
+  audioWarnings?: string[];
   continuityRegenerations: number;
   continuityWarnings: string[];
   elementsUsed?: string[];
@@ -371,6 +418,9 @@ export interface RenderedSceneVideo {
 
 export interface FactoryGenerationRequest {
   prompt: string;
+  spoken_script?: string;
+  request_id?: string;
+  chat_id?: string;
   target_duration_seconds: number;
   scene_duration_seconds: number;
   aspect_ratio: AspectRatio;
@@ -398,6 +448,8 @@ export interface FactoryGenerationRequest {
 }
 
 export interface FactoryGenerationResponse {
+  warnings?: string[];
+  delivery_complete?: boolean;
   final_video_url: string;
   final_download_url: string;
   final_filename: string;
@@ -440,6 +492,7 @@ export interface FactoryGenerationResponse {
   youtube_video_id: string | null;
   youtube_url: string | null;
   youtube_privacy: YouTubePrivacy | null;
+  scene_results?: Array<{ scene_index: number; filename: string; video_url: string; download_url: string; visual_qc_status?: QualityCheckStatus; audio_qc_status?: QualityCheckStatus; visual_qc?: Record<string, unknown>; audio_qc?: Record<string, unknown> }>;
 }
 
 export interface BillingPack {

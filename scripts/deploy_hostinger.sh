@@ -16,11 +16,12 @@ chmod 700 storage/backups || true
 python3 scripts/production_preflight.py
 
 # Capture a consistent SQLite/metrics backup before replacing containers.
-python3 scripts/backup_state.py || {
-  echo "Warning: pre-deploy state backup failed; continuing because the application may be fresh." >&2
-}
+python3 scripts/backup_state.py
 
 "${COMPOSE[@]}" build --pull
+# Validate the deployed CPU worker and model manifest before replacing the API.
+# This check performs no GPU render.
+"${COMPOSE[@]}" run --rm --no-deps api python /app/scripts/check_inference.py --all
 "${COMPOSE[@]}" up -d --remove-orphans
 
 echo "Waiting for API readiness..."
@@ -37,8 +38,9 @@ for _ in $(seq 1 60); do
           "https://$domain/api/v1/health/ready" >/dev/null 2>&1; then
         echo "Public HTTPS health check passed."
       else
-        echo "Warning: containers are healthy, but public HTTPS is not reachable yet." >&2
+        echo "Deployment verification failed: public HTTPS is not reachable." >&2
         echo "Check DNS A/AAAA records, Hostinger firewall/UFW, Nginx config, and Certbot certificate status." >&2
+        exit 1
       fi
     fi
     exit 0

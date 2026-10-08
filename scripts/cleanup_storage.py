@@ -48,10 +48,21 @@ def cleanup_generated(apply: bool) -> tuple[int, int]:
     if not GENERATED.exists():
         return removed, bytes_removed
 
+    owned: set[str] = set()
+    active: set[str] = set()
+    if JOBS_DB.exists():
+        with sqlite3.connect(JOBS_DB) as connection:
+            has_assets = connection.execute("SELECT 1 FROM sqlite_master WHERE name='generated_assets'").fetchone()
+            if has_assets:
+                owned = {row[0] for row in connection.execute("SELECT filename FROM generated_assets")}
+                active = {row[0] for row in connection.execute(
+                    "SELECT a.filename FROM generated_assets a JOIN generation_jobs j ON j.id=a.job_id WHERE j.status IN ('queued','running')"
+                )}
+
     for path in GENERATED.iterdir():
-        if not path.is_file() or path.name.endswith(".part"):
+        if not path.is_file() or path.name.endswith(".part") or path.name in active:
             continue
-        days = final_days if path.name.startswith(("final-", "factory-")) else preview_days
+        days = final_days if path.name in owned or path.name.startswith(("final-", "factory-")) else preview_days
         if not expired(path, days, now):
             continue
         size = path.stat().st_size
@@ -66,7 +77,7 @@ def cleanup_generated(apply: bool) -> tuple[int, int]:
 def prune_jobs(apply: bool) -> int:
     if not JOBS_DB.exists():
         return 0
-    retention = env_int("JOB_RETENTION_DAYS", 14)
+    retention = max(env_int("JOB_RETENTION_DAYS", 14), env_int("FINAL_RETENTION_DAYS", 30))
     cutoff = time.time() - retention * 86400
     cutoff_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(cutoff))
     connection = sqlite3.connect(JOBS_DB)

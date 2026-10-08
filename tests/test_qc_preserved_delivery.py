@@ -88,12 +88,6 @@ class RetainQCRejectedVideoTests(unittest.TestCase):
                     youtube_title="Test presenter video" if publish else None,
                     enhance_prompt=False,
                 )
-                if not preserve:
-                    with self.assertRaisesRegex(RuntimeError, "continuity QC failed"):
-                        factory_service.run_factory_generation(request, workspace_id="demo")
-                    self.assertFalse(scene_video.exists(), "Legacy fail-closed setting should reject the clip")
-                    return
-
                 result = factory_service.run_factory_generation(request, workspace_id="demo")
                 self.assertTrue(scene_video.exists(), "QC must not delete the rendered scene")
                 self.assertEqual(final_video.read_bytes(), b"FINAL_VIDEO")
@@ -120,7 +114,7 @@ class RetainQCRejectedVideoTests(unittest.TestCase):
     def test_strict_qc_failure_skips_auto_publish(self):
         self._run_fake_factory(preserve=True, publish=True)
 
-    def test_legacy_strict_delete_can_be_reenabled(self):
+    def test_legacy_flag_cannot_destroy_render(self):
         self._run_fake_factory(preserve=False)
 
     def test_qc_pass_is_reported(self):

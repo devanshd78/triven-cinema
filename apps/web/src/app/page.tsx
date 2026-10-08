@@ -1,13 +1,21 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
+import Image from "next/image";
+import { ReferenceUploadPreview } from "@/components/ReferenceUploadPreview";
+import { referenceFileKey, selectReferenceFiles } from "@/lib/element-uploads";
 
 import {
   absoluteApiUrl,
   addElementAssets,
   archiveElement,
-  combineSceneVideos,
+  ApiError,
+  GenerationJobError,
+  createCombineGenerationJob,
+  createAudioRetakeJob,
+  listGenerationJobs,
+  waitForJobResult,
   connectYouTube,
   createElement,
   createBillingPortal,
@@ -30,15 +38,16 @@ import {
   updateElement,
   verifyCheckout,
   verifyLoginOtp,
-  waitForFactoryGenerationJob,
-  waitForVideoGenerationJob,
 } from "@/lib/api/cinema";
 import type { AuthUser, ServerChatSession } from "@/lib/api/cinema";
+import { reconcileChatSessions, invalidateSceneChain } from "@/lib/chat-history";
 import { aggregateQCStatus, qcStatusLabel, resolveQCStatus } from "@/lib/qc-report";
 import type { QCStatus, VideoQCReport } from "@/lib/qc-report";
 import type {
   AspectRatio,
   AudioMode,
+  AudioRetakeRequest,
+  AudioRetakeResponse,
   BillingCatalogResponse,
   BillingMeResponse,
   CinemaElement,
@@ -51,6 +60,12 @@ import type {
   DecoderName,
   FactoryGenerationResponse,
   GenerationCapabilitiesResponse,
+  GenerationJobResponse,
+  VideoGenerationRequest,
+  VideoGenerationResponse,
+  FactoryGenerationRequest,
+  CombineScenesRequest,
+  CombineScenesResponse,
   GenerationMode,
   RenderedSceneVideo,
   RenderQuality,
@@ -87,7 +102,20 @@ type FinalVideo = {
   youtubeUrl?: string | null;
   youtubePrivacy?: string | null;
   qcReport?: VideoQCReport;
+  factoryResult?: FactoryGenerationResponse;
+  aspectRatio?: AspectRatio;
+  createdAt?: number;
 } | null;
+
+type PendingJob = {
+  requestId: string;
+  jobId?: string;
+  kind: "video" | "factory" | "combine" | "audio_retake";
+  sceneId?: number;
+  renderSignature?: string;
+  aspectRatio: AspectRatio;
+  payload: VideoGenerationRequest | FactoryGenerationRequest | CombineScenesRequest | AudioRetakeRequest;
+};
 
 type StudioChatWorkspace = {
   prompt: string;
@@ -100,6 +128,11 @@ type StudioChatWorkspace = {
   quality: RenderQuality;
   audioMode: AudioMode;
   audioDirection: string;
+  spokenScript: string;
+  videoTakes: NonNullable<FinalVideo>[];
+  activeJob: PendingJob | null;
+  jobError: string;
+  recoveredAssets: NonNullable<GenerationJobResponse["assets"]>;
   decoder: DecoderName;
   realismProfile: RealismProfile;
   seed: number;
@@ -128,6 +161,7 @@ type StudioChatSession = {
   title: string;
   createdAt: number;
   updatedAt: number;
+  dirty?: boolean;
   workspace: StudioChatWorkspace;
 };
 
@@ -147,6 +181,11 @@ function createEmptyChatWorkspace(): StudioChatWorkspace {
     quality: "1080p",
     audioMode: "mastered",
     audioDirection: DEFAULT_AUDIO_DIRECTION,
+    spokenScript: "",
+    videoTakes: [],
+    activeJob: null,
+    jobError: "",
+    recoveredAssets: [],
     decoder: "conv",
     realismProfile: "real_skin",
     seed: 42,
@@ -184,10 +223,11 @@ function normalizeChatWorkspace(value: Partial<StudioChatWorkspace> | null | und
     elementStrengths: value?.elementStrengths || {},
     scenePrompts: value?.scenePrompts || {},
     renderedVideos: value?.renderedVideos || {},
+    videoTakes: value?.videoTakes?.length ? value.videoTakes : savedVideo ? [savedVideo] : [],
     // Older saved Factory chats already contain verdicts, just not an attached
     // per-video report. Recover their QC status when history is reopened.
     finalVideo: savedVideo && !savedVideo.qcReport && savedFactoryResult && savedVideo.filename === savedFactoryResult.final_filename
-      ? { ...savedVideo, qcReport: factoryQCReport(savedFactoryResult) }
+      ? { ...savedVideo, qcReport: factoryQCReport(savedFactoryResult), factoryResult: savedFactoryResult }
       : savedVideo || null,
   };
 }
@@ -223,6 +263,7 @@ function createChatSession(workspace = createEmptyChatWorkspace()): StudioChatSe
     title: chatTitleFromPrompt(workspace.prompt),
     createdAt: now,
     updatedAt: now,
+    dirty: true,
     workspace,
   };
 }
@@ -490,6 +531,17 @@ export default function Home() {
   const [quality, setQuality] = useState<RenderQuality>("1080p");
   const [audioMode, setAudioMode] = useState<AudioMode>("mastered");
   const [audioDirection, setAudioDirection] = useState(DEFAULT_AUDIO_DIRECTION);
+  const [spokenScript, setSpokenScript] = useState("");
+  const [videoTakes, setVideoTakes] = useState<NonNullable<FinalVideo>[]>([]);
+  const [activeJob, setActiveJob] = useState<PendingJob | null>(null);
+  const [jobError, setJobError] = useState("");
+  const [serverJobs, setServerJobs] = useState<GenerationJobResponse[]>([]);
+  const [recoveredAssets, setRecoveredAssets] = useState<NonNullable<GenerationJobResponse["assets"]>>([]);
+  const [historySaveState, setHistorySaveState] = useState<"saved" | "saving" | "offline">("saved");
+  const [historyRetry, setHistoryRetry] = useState(0);
+  const jobController = useRef<AbortController | null>(null);
+  const sessionsRef = useRef<StudioChatSession[]>([]);
+  const accountVersion = useRef(0);
   const provider: VideoProviderName = "modal";
   const model: VideoModelName = "ltx-2.5";
   const [decoder, setDecoder] = useState<DecoderName>("conv");
@@ -525,6 +577,11 @@ export default function Home() {
   const [selectedElementId, setSelectedElementId] = useState<string | null>(null);
   const [elementDescription, setElementDescription] = useState("");
   const [elementFiles, setElementFiles] = useState<File[]>([]);
+  const [elementUploadError, setElementUploadError] = useState("");
+  const [elementFileRoles, setElementFileRoles] = useState<Record<string, ElementAssetRole>>({});
+  const elementSaveRequest = useRef({ signature: "", id: "" });
+  const elementAddRequests = useRef(new Map<string, string>());
+  const creatorRef = useRef<HTMLDivElement>(null);
   const [elementModes, setElementModes] = useState<Record<string, ElementReferenceMode>>({});
   const [elementWardrobePolicies, setElementWardrobePolicies] = useState<Record<string, ElementWardrobePolicy>>({});
   const [elementApplyAll, setElementApplyAll] = useState<Record<string, boolean>>({});
@@ -560,9 +617,9 @@ export default function Home() {
 
   const durationOptions = DURATION_OPTIONS[quality];
   const factoryDurationOptions = FACTORY_SCENE_OPTIONS[quality].filter((value) => value <= factoryTargetSeconds);
-  const isBusy = planning || directGenerating || factoryGenerating || generatingScene !== null || creatingFinal;
+  const isBusy = Boolean(activeJob) || planning || directGenerating || factoryGenerating || generatingScene !== null || creatingFinal;
   const renderedSceneCount = Object.keys(renderedVideos).length;
-  const allScenesRendered = !!result && result.scenes.length > 0 && result.scenes.every((scene) => Boolean(renderedVideos[scene.id]));
+  const allScenesRendered = !!result && result.scenes.length > 0 && result.scenes.every((scene) => Boolean(renderedVideos[scene.id]) && renderedVideos[scene.id].renderSignature === sceneRenderSignature(scene.id));
   const plannedDuration = useMemo(() => result ? result.scenes.length * durationSeconds : 0, [result, durationSeconds]);
   const filteredElements = useMemo(() => {
     const query = elementSearch.trim().toLowerCase();
@@ -583,7 +640,7 @@ export default function Home() {
       version_id: element.current_version_id,
       handle: element.handle,
       reference_mode: elementModes[element.id] || "identity",
-      wardrobe_policy: element.type === "character" ? (elementWardrobePolicies[element.id] || "prompt") : "reference",
+      wardrobe_policy: element.type === "character" ? (elementWardrobePolicies[element.id] || "reference") : "reference",
       strength: Math.max(0, Math.min(1, elementStrengths[element.id] ?? 1.0)),
       apply_to_all_scenes: Boolean(elementApplyAll[element.id]),
     })),
@@ -621,6 +678,37 @@ export default function Home() {
     [chatSessions, activeChatId, prompt]
   );
 
+  const overlayOpen = showElementCreator || showReferencePicker || showElementsLibrary;
+  useEffect(() => {
+    if (!overlayOpen) return;
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { document.body.style.overflow = previous; };
+  }, [overlayOpen]);
+
+  const closeCreatorOnEscape = useEffectEvent(() => { if (!elementBusy) setShowElementCreator(false); });
+  useEffect(() => {
+    if (!showElementCreator) return;
+    const previous = document.activeElement as HTMLElement | null;
+    const modal = creatorRef.current;
+    modal?.querySelector<HTMLInputElement>("input")?.focus({ preventScroll: true });
+    function trapFocus(event: KeyboardEvent) {
+      if (event.key === "Escape") closeCreatorOnEscape();
+      if (event.key !== "Tab" || !modal) return;
+      const controls = Array.from(modal.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled)"))
+        .filter((control) => control.getClientRects().length > 0);
+      const first = controls[0];
+      const last = controls.at(-1);
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+    }
+    document.addEventListener("keydown", trapFocus);
+    return () => {
+      document.removeEventListener("keydown", trapFocus);
+      previous?.focus({ preventScroll: true });
+    };
+  }, [showElementCreator]);
+
   useEffect(() => {
     let active = true;
     async function restoreLogin() {
@@ -656,46 +744,46 @@ export default function Home() {
   }
 
   useEffect(() => {
-    if (!authUser) {
-      setChatSessions([]);
-      setActiveChatId(null);
-      setChatHistoryReady(false);
-      return;
-    }
+    if (!authUser) return;
     let active = true;
-    setChatHistoryReady(false);
-    setActiveChatId(null);
     async function loadHistory() {
+      await Promise.resolve();
+      if (!active) return;
+      setChatHistoryReady(false);
+      setActiveChatId(null);
+      const cached = readStoredChatSessions(authUser!.id);
+      let sessions = cached;
       try {
         const response = await listChatHistory();
         if (!active) return;
-        let sessions = response.chats.map(chatFromServer).sort((a, b) => b.updatedAt - a.updatedAt);
-        if (sessions.length === 0) {
-          // One-time migration from the pre-login browser history. Only migrate
-          // after a successful empty server response, so shared-browser data is
-          // never used as a fallback for an existing account.
-          const localMigration = readStoredChatSessions(authUser?.id, true);
-          if (localMigration.length) {
-            sessions = localMigration;
-            void Promise.allSettled(localMigration.map((item) => saveChatHistoryItem(chatToServer(item))));
-            window.localStorage.removeItem(LEGACY_CHAT_HISTORY_STORAGE_KEY);
-          }
-        }
-        setChatSessions(sessions);
-        persistChatSessions(sessions, authUser?.id);
+        sessions = reconcileChatSessions(response.chats.map(chatFromServer), cached);
+        // Reconcile locally completed renders after a failed or interrupted save.
+        await Promise.allSettled(sessions.filter((session) => {
+          const remote = response.chats.find((entry) => entry.id === session.id);
+          return !remote || session.updatedAt > remote.updated_at;
+        }).map((session) => saveChatHistoryItem(chatToServer(session))));
       } catch {
         if (!active) return;
-        // Server history is canonical. Offline fallback is account-scoped only.
-        setChatSessions(readStoredChatSessions(authUser?.id));
-      } finally {
-        if (active) setChatHistoryReady(true);
+        setHistorySaveState("offline");
       }
+      if (!active) return;
+      sessionsRef.current = sessions;
+      setChatSessions(sessions);
+      persistChatSessions(sessions, authUser!.id);
+      const unfinished = sessions.find((session) => session.workspace.activeJob);
+      if (unfinished) {
+        setActiveChatId(unfinished.id);
+        restoreWorkspace(unfinished.workspace);
+      }
+      setChatHistoryReady(true);
     }
     void loadHistory();
     return () => { active = false; };
-  }, [authUser?.id]);
+  }, [authUser]);
 
-  useEffect(() => {
+  const restoreWorkspace = useEffectEvent((workspace: StudioChatWorkspace) => applyChatWorkspace(workspace));
+
+  const syncWorkspace = useEffectEvent(() => {
     if (!chatHistoryReady) return;
     const workspace: StudioChatWorkspace = {
       prompt,
@@ -708,6 +796,11 @@ export default function Home() {
       quality,
       audioMode,
       audioDirection,
+      spokenScript,
+      videoTakes,
+      activeJob,
+      jobError,
+      recoveredAssets,
       decoder,
       realismProfile,
       seed,
@@ -740,6 +833,7 @@ export default function Home() {
       setChatSessions((current) => {
         const sorted = [session, ...current].sort((a, b) => b.updatedAt - a.updatedAt);
         persistChatSessions(sorted, authUser?.id);
+        sessionsRef.current = sorted;
         return sorted;
       });
       return;
@@ -755,15 +849,23 @@ export default function Home() {
           ...session,
           title: prompt.trim() ? chatTitleFromPrompt(prompt) : session.title,
           updatedAt: now,
+          dirty: true,
           workspace,
         };
       });
       if (!found) return current;
       const sorted = next.sort((a, b) => b.updatedAt - a.updatedAt);
       persistChatSessions(sorted, authUser?.id);
+      sessionsRef.current = sorted;
       return sorted;
     });
+  });
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => syncWorkspace(), 0);
+    return () => window.clearTimeout(timer);
   }, [
+    authUser?.id,
     chatHistoryReady,
     activeChatId,
     prompt,
@@ -776,6 +878,11 @@ export default function Home() {
     quality,
     audioMode,
     audioDirection,
+    spokenScript,
+    videoTakes,
+    activeJob,
+    jobError,
+    recoveredAssets,
     decoder,
     realismProfile,
     seed,
@@ -800,16 +907,75 @@ export default function Home() {
   ]);
 
   useEffect(() => {
-    if (!authUser || !chatHistoryReady || !activeChatId) return;
-    const session = chatSessions.find((item) => item.id === activeChatId);
-    if (!session) return;
-    const timer = window.setTimeout(() => {
-      void saveChatHistoryItem(chatToServer(session)).catch(() => {
-        // Keep the local cache as a resilience fallback; the next edit retries.
-      });
+    if (!authUser || !chatHistoryReady) return;
+    const pending = chatSessions.filter((session) => session.dirty);
+    if (!pending.length) return;
+    const epoch = accountVersion.current;
+    let active = true;
+    const timer = window.setTimeout(async () => {
+      setHistorySaveState("saving");
+      try {
+        await Promise.all(pending.map((session) => saveChatHistoryItem(chatToServer(session))));
+        if (epoch === accountVersion.current) {
+          const versions = new Map(pending.map((session) => [session.id, session.updatedAt]));
+          setChatSessions((current) => {
+            const next = current.map((session) => versions.get(session.id) === session.updatedAt ? { ...session, dirty: false } : session);
+            sessionsRef.current = next;
+            persistChatSessions(next, authUser.id);
+            return next;
+          });
+          if (active) setHistorySaveState("saved");
+        }
+      } catch {
+        if (active && epoch === accountVersion.current) setHistorySaveState("offline");
+      }
     }, 700);
-    return () => window.clearTimeout(timer);
-  }, [authUser?.id, chatHistoryReady, activeChatId, chatSessions]);
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [authUser, chatHistoryReady, chatSessions, historyRetry]);
+
+  useEffect(() => {
+    if (historySaveState !== "offline") return;
+    const timer = window.setTimeout(() => setHistoryRetry((current) => current + 1), 15000);
+    const retry = () => setHistoryRetry((current) => current + 1);
+    window.addEventListener("online", retry);
+    return () => { window.clearTimeout(timer); window.removeEventListener("online", retry); };
+  }, [historySaveState, historyRetry]);
+
+  useEffect(() => () => { jobController.current?.abort(); }, []);
+
+  async function recoverSavedJob(job: PendingJob) {
+    if (jobController.current) return;
+    try {
+      if (job.kind === "audio_retake") {
+        const response = await executeTrackedJob<AudioRetakeResponse>(job);
+        rememberVideo(audioRetakeVideo(response), job.aspectRatio);
+      } else if (job.kind === "factory") {
+        const response = await executeTrackedJob<FactoryGenerationResponse>(job);
+        setFactoryResult(response);
+        rememberVideo(factoryVideoFromResponse(response), job.aspectRatio);
+      } else if (job.kind === "combine") {
+        const response = await executeTrackedJob<CombineScenesResponse>(job);
+        rememberVideo({ url: absoluteApiUrl(response.final_video_url), downloadUrl: absoluteApiUrl(response.final_download_url), filename: response.final_filename, label: `${response.scene_count} scenes · recovered composition`, qualityNote: [response.quality_note, ...(response.warnings || [])].filter(Boolean).join(" "), hasAudio: response.media_info.has_audio, audioCodec: response.media_info.audio_codec, dimensions: `${response.media_info.width}×${response.media_info.height}`, qcReport: { visual: response.visual_qc_status || "unknown", audio: response.audio_qc_status || "unknown", visualWarnings: response.warnings || [], audioWarnings: [], visualRetries: 0, audioRetakes: 0 } }, job.aspectRatio);
+      } else {
+        const response = await executeTrackedJob<VideoGenerationResponse>(job);
+        if (job.sceneId != null) {
+          setRenderedVideos((current) => ({ ...current, [job.sceneId!]: { ...sceneVideoFromResponse(response), renderSignature: job.renderSignature } }));
+          const take = { ...finalFromSceneResponse(response)!, aspectRatio: job.aspectRatio, label: `Scene ${job.sceneId} · recovered render`, createdAt: Date.now() };
+          setVideoTakes((current) => [take, ...current.filter((item) => item.filename !== take.filename)]);
+          setNotice("Scene recovered. Render remaining scenes or combine when ready.");
+        } else rememberVideo(finalFromSceneResponse(response)!, job.aspectRatio);
+      }
+    } catch (err) {
+      if (!(err instanceof DOMException && err.name === "AbortError")) setError(errorMessage(err, "Unable to recover this job."));
+    } finally { setProgressMessage(""); }
+  }
+
+  const resumeSavedJob = useEffectEvent(recoverSavedJob);
+
+  useEffect(() => {
+    if (!authUser || !chatHistoryReady || !activeJob || jobController.current) return;
+    void resumeSavedJob(activeJob);
+  }, [authUser, chatHistoryReady, activeJob]);
 
   useEffect(() => {
     if (!authUser) return;
@@ -859,10 +1025,25 @@ export default function Home() {
     }
     void bootstrap();
     return () => { active = false; };
-  }, [authUser?.id]);
+  }, [authUser]);
+
+  useEffect(() => {
+    if (!authUser || !activeChatId) return;
+    let active = true;
+    void listGenerationJobs(activeChatId).then((jobs) => { if (active) setServerJobs(jobs); }).catch(() => { /* The saved chat still supplies local recovery. */ });
+    return () => { active = false; };
+  }, [authUser, activeChatId, activeJob]);
+
+  function recoverServerJob(job: GenerationJobResponse) {
+    if (isBusy || !activeChatId || (job.chat_id || job.payload.chat_id) !== activeChatId || !["video", "factory", "combine", "audio_retake"].includes(job.job_type)) return;
+    const kind = job.job_type as PendingJob["kind"];
+    const sceneIndex = typeof job.payload.scene_index === "number" ? job.payload.scene_index : undefined;
+    void recoverSavedJob({ kind, requestId: String(job.payload.request_id || job.job_id), jobId: job.job_id, sceneId: sceneIndex == null ? undefined : result?.scenes[sceneIndex]?.id, aspectRatio: (job.payload.aspect_ratio as AspectRatio) || aspectRatio, payload: job.payload as unknown as PendingJob["payload"] });
+  }
 
   function applyChatWorkspace(rawWorkspace: StudioChatWorkspace) {
     const workspace = normalizeChatWorkspace(rawWorkspace);
+    setServerJobs([]);
     setPrompt(workspace.prompt);
     setMode(workspace.mode);
     setAspectRatio(workspace.aspectRatio);
@@ -873,6 +1054,11 @@ export default function Home() {
     setQuality(workspace.quality);
     setAudioMode(workspace.audioMode);
     setAudioDirection(workspace.audioDirection);
+    setSpokenScript(workspace.spokenScript);
+    setVideoTakes(workspace.videoTakes);
+    setActiveJob(workspace.activeJob);
+    setJobError(workspace.jobError);
+    setRecoveredAssets(workspace.recoveredAssets);
     setDecoder(workspace.decoder);
     setRealismProfile(workspace.realismProfile);
     setSeed(workspace.seed);
@@ -937,6 +1123,7 @@ export default function Home() {
     if (!window.confirm(`Delete “${target.title}” from chat history? Rendered media files will not be deleted.`)) return;
 
     const remaining = chatSessions.filter((session) => session.id !== chatId);
+    sessionsRef.current = remaining;
     setChatSessions(remaining);
     persistChatSessions(remaining, authUser?.id);
     try {
@@ -978,28 +1165,37 @@ export default function Home() {
     setScenePrompts({});
     setRenderedVideos({});
     setFactoryResult(null);
-    setFinalVideo(null);
+    // Previous takes remain available until a replacement has completed.
+
     setEditingScene(null);
     setProgressMessage("");
   }
 
   function invalidateRenderedMedia() {
     setRenderedVideos({});
-    setFinalVideo(null);
+    // Previous takes remain available until a replacement has completed.
+
   }
 
   async function refreshBilling() {
     try { setBillingMe(await getBillingMe()); } catch { /* optional integration */ }
   }
 
-  async function refreshElements() {
-    setElementsLoading(true);
-    try {
-      const response = await listElements();
-      setElements(response.elements);
-    } finally {
-      setElementsLoading(false);
-    }
+  function storeElement(element: CinemaElement) {
+    setElements((current) => {
+      if (element.status === "archived") return current.filter((item) => item.id !== element.id);
+      return current.some((item) => item.id === element.id)
+        ? current.map((item) => item.id === element.id ? element : item)
+        : [element, ...current];
+    });
+  }
+
+  function selectElementFiles(incoming: File[]) {
+    if (elementBusy) return;
+    const selected = selectReferenceFiles(elementFiles, incoming,
+      capabilities?.elements?.max_assets_per_element ?? 8, capabilities?.elements?.max_upload_mb ?? 15);
+    setElementFiles(selected.files);
+    setElementUploadError(selected.error);
   }
 
   function updateMentionState(value: string) {
@@ -1019,6 +1215,7 @@ export default function Home() {
   }
 
   function insertElementMention(element: CinemaElement) {
+    if (isBusy) return;
     if (!canActivateElement(element)) return;
     setSelectedElementId(element.id);
     const mention = `@${element.handle}`;
@@ -1028,7 +1225,7 @@ export default function Home() {
     }
     setMentionQuery(null);
     setElementModes((current) => ({ ...current, [element.id]: current[element.id] || "identity" }));
-    if (element.type === "character") setElementWardrobePolicies((current) => ({ ...current, [element.id]: current[element.id] || "prompt" }));
+    if (element.type === "character") setElementWardrobePolicies((current) => ({ ...current, [element.id]: current[element.id] || "reference" }));
     setElementStrengths((current) => ({ ...current, [element.id]: current[element.id] ?? 1.0 }));
     setElementApplyAll((current) => ({
       ...current,
@@ -1037,6 +1234,7 @@ export default function Home() {
   }
 
   function removeElementFromScene(element: CinemaElement) {
+    if (isBusy) return;
     const mentionPattern = new RegExp(`(^|\\s)@${escapeRegExp(element.handle)}\\b\\s*`, "gi");
     setPrompt((current) => current.replace(mentionPattern, "$1").replace(/ {2,}/g, " ").trimStart());
     setElementApplyAll((current) => ({ ...current, [element.id]: false }));
@@ -1056,13 +1254,14 @@ export default function Home() {
   }
 
   function chooseMention(element: CinemaElement) {
+    if (isBusy) return;
     if (mentionQuery == null || !canActivateElement(element)) return;
     setSelectedElementId(element.id);
     const next = prompt.replace(/@([A-Za-z0-9_-]*)$/, `@${element.handle} `);
     setPrompt(next);
     setMentionQuery(null);
     setElementModes((current) => ({ ...current, [element.id]: current[element.id] || "identity" }));
-    if (element.type === "character") setElementWardrobePolicies((current) => ({ ...current, [element.id]: current[element.id] || "prompt" }));
+    if (element.type === "character") setElementWardrobePolicies((current) => ({ ...current, [element.id]: current[element.id] || "reference" }));
     setElementStrengths((current) => ({ ...current, [element.id]: current[element.id] ?? 1.0 }));
     setElementApplyAll((current) => ({
       ...current,
@@ -1071,6 +1270,7 @@ export default function Home() {
   }
 
   function applyCreatorGradePreset() {
+    if (isBusy) return;
     const activeCharacters = referencedElements.filter((element) => element.type === "character");
     // Creator-grade is a quality/consistency preset, not a duration preset.
     // Preserve the runtime and scene length the user selected.
@@ -1116,12 +1316,20 @@ export default function Home() {
   }
 
   async function handleCreateElement() {
+    if (isBusy || elementBusy) return;
     if (!elementName.trim() || !elementHandle.trim() || elementFiles.length === 0) {
-      setError("Element needs a name, @handle and at least one reference image.");
+      setElementUploadError("Enter a name, @handle and at least one reference image.");
+      return;
+    }
+    if (!/^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(elementHandle)) {
+      setElementUploadError("The handle must start with a letter and use up to 32 letters, numbers, underscores or hyphens.");
       return;
     }
     setElementBusy(true);
-    setError("");
+    setElementUploadError("");
+    const roles = elementFiles.map((file, index) => elementFileRoles[referenceFileKey(file)] || suggestedElementRoles(elementType, elementFiles.length)[index]);
+    const signature = JSON.stringify([elementName.trim(), elementHandle, elementType, elementDescription.trim(), roles, elementFiles.map(referenceFileKey)]);
+    if (elementSaveRequest.current.signature !== signature) elementSaveRequest.current = { signature, id: crypto.randomUUID() };
     try {
       const created = await createElement({
         name: elementName.trim(),
@@ -1129,36 +1337,47 @@ export default function Home() {
         type: elementType,
         description: elementDescription.trim(),
         files: elementFiles,
-        roles: suggestedElementRoles(elementType, elementFiles.length),
+        roles,
+        requestId: elementSaveRequest.current.id,
       });
-      await refreshElements();
+      storeElement(created);
       setSelectedElementId(created.id);
       setShowElementCreator(false);
       setElementName("");
       setElementHandle("");
       setElementDescription("");
       setElementFiles([]);
+      setElementFileRoles({});
+      elementSaveRequest.current = { signature: "", id: "" };
       insertElementMention(created);
       setNotice(`Saved @${created.handle} as a reusable ${created.type} Element.`);
     } catch (err) {
-      setError(errorMessage(err, "Unable to create Element."));
+      setElementUploadError(errorMessage(err, "Unable to save. Your selected images are still here; retry when the connection returns."));
     } finally {
       setElementBusy(false);
     }
   }
 
   async function handleAddElementReferences(element: CinemaElement, files: FileList | null) {
+    if (isBusy || elementBusy) return;
     if (!files?.length) return;
     setElementBusy(true);
     setError("");
     try {
       const incoming = Array.from(files);
-      await addElementAssets(
+      const selected = selectReferenceFiles([], incoming,
+        (capabilities?.elements?.max_assets_per_element ?? 8) - element.assets.length, capabilities?.elements?.max_upload_mb ?? 15);
+      if (selected.error) throw new Error(selected.error);
+      const signature = JSON.stringify([element.id, incoming.map(referenceFileKey)]);
+      const requestId = elementAddRequests.current.get(signature) || crypto.randomUUID();
+      elementAddRequests.current.set(signature, requestId);
+      const updated = await addElementAssets(
         element.id,
         incoming,
-        suggestedElementRoles(element.type, incoming.length, element.assets.map((asset) => asset.role))
+        suggestedElementRoles(element.type, incoming.length, element.assets.map((asset) => asset.role)),
+        requestId
       );
-      await refreshElements();
+      storeElement(updated);
       setNotice(`Added reference images to @${element.handle}. A new immutable Element version was created.`);
     } catch (err) {
       setError(errorMessage(err, "Unable to add Element references."));
@@ -1168,12 +1387,12 @@ export default function Home() {
   }
 
   async function handleSetPrimaryElementAsset(element: CinemaElement, assetId: string) {
+    if (isBusy) return;
     if (assetId === element.primary_asset_id) return;
     setElementBusy(true);
     setError("");
     try {
-      await updateElement(element.id, { primary_asset_id: assetId });
-      await refreshElements();
+      storeElement(await updateElement(element.id, { primary_asset_id: assetId }));
       setNotice(`Updated the canonical reference for @${element.handle}. A new immutable Element version was created.`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to update the canonical Element reference.");
@@ -1183,11 +1402,11 @@ export default function Home() {
   }
 
   async function handleArchiveElement(element: CinemaElement) {
+    if (isBusy) return;
     setElementBusy(true);
     setError("");
     try {
-      await archiveElement(element.id);
-      await refreshElements();
+      storeElement(await archiveElement(element.id));
       setNotice(`Archived @${element.handle}. Existing renders remain tied to their saved version.`);
     } catch (err) {
       setError(errorMessage(err, "Unable to archive Element."));
@@ -1196,17 +1415,93 @@ export default function Home() {
     }
   }
 
-  async function generateThroughJob(payload: Parameters<typeof createVideoGenerationJob>[0]) {
-    const started = await createVideoGenerationJob(payload);
-    return waitForVideoGenerationJob(started.job_id, (job) => setProgressMessage(`${job.message} ${job.progress}%`));
+  function persistJobSnapshot(job: PendingJob | null, patch: Partial<StudioChatWorkspace> = {}) {
+    if (!authUser || !activeChatId) return;
+    const current = sessionsRef.current;
+    const previous = current.find((session) => session.id === activeChatId);
+    if (!previous) return;
+    const session = { ...previous, updatedAt: Date.now(), dirty: true, workspace: { ...previous.workspace, ...patch, activeJob: job } };
+    const next = current.map((item) => item.id === session.id ? session : item);
+    sessionsRef.current = next;
+    persistChatSessions(next, authUser.id);
+    setChatSessions(next);
+    void saveChatHistoryItem(chatToServer(session)).catch(() => setHistorySaveState("offline"));
   }
 
-  function finalFromSceneResponse(response: Awaited<ReturnType<typeof generateThroughJob>>): FinalVideo {
+  function rememberVideo(video: NonNullable<FinalVideo>, ratio = aspectRatio) {
+    const saved = { ...video, aspectRatio: video.aspectRatio || ratio, createdAt: video.createdAt || Date.now() };
+    setFinalVideo(saved);
+    setFactoryResult(saved.factoryResult || null);
+    setVideoTakes((current) => [saved, ...current.filter((item) => item.filename !== saved.filename)]);
+  }
+
+  async function executeTrackedJob<T>(job: PendingJob): Promise<T> {
+    const controller = new AbortController();
+    jobController.current = controller;
+    const account = accountVersion.current;
+    setJobError("");
+    setActiveJob(job);
+    persistJobSnapshot(job);
+    try {
+      if (!job.jobId) {
+        for (;;) {
+          controller.signal.throwIfAborted();
+          try {
+            const started = job.kind === "factory"
+              ? await createFactoryGenerationJob(job.payload as FactoryGenerationRequest)
+              : job.kind === "audio_retake"
+                ? await createAudioRetakeJob(job.payload as AudioRetakeRequest)
+                : job.kind === "combine"
+                ? await createCombineGenerationJob(job.payload as CombineScenesRequest)
+                : await createVideoGenerationJob(job.payload as VideoGenerationRequest);
+            job = { ...job, jobId: started.job_id };
+            setActiveJob(job);
+            persistJobSnapshot(job);
+            break;
+          } catch (err) {
+            if (err instanceof ApiError && ![408, 429, 502, 503, 504].includes(err.status)) throw err;
+            if (err instanceof DOMException && err.name === "AbortError") throw err;
+            setProgressMessage("Reconnecting to your saved request. It will not create a duplicate render.");
+            await new Promise((resolve) => setTimeout(resolve, 3000));
+          }
+        }
+      }
+      const response = await waitForJobResult<T>(job.jobId!, (status) => {
+        setProgressMessage(`${status.message} ${status.progress}%`);
+        if (status.assets?.length) setRecoveredAssets(status.assets);
+      }, 1500, controller.signal, setProgressMessage);
+      if (account !== accountVersion.current) throw new DOMException("Account changed", "AbortError");
+      return response;
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") throw err;
+      const message = errorMessage(err, "Generation failed.");
+      setJobError(message);
+      if (err instanceof GenerationJobError) setRecoveredAssets(err.job.assets || []);
+      persistJobSnapshot(null, { jobError: message, recoveredAssets: err instanceof GenerationJobError ? err.job.assets || [] : recoveredAssets });
+      throw err;
+    } finally {
+      if (account === accountVersion.current) {
+        setActiveJob(null);
+        jobController.current = null;
+      }
+    }
+  }
+
+  function newJob(kind: PendingJob["kind"], payload: PendingJob["payload"], sceneId?: number): PendingJob {
+    const requestId = crypto.randomUUID();
+    return { kind, requestId, sceneId, renderSignature: sceneId == null ? undefined : sceneRenderSignature(sceneId), aspectRatio, payload: { ...payload, request_id: requestId, chat_id: activeChatId || undefined } };
+  }
+
+  async function generateThroughJob(payload: VideoGenerationRequest, sceneId?: number) {
+    return executeTrackedJob<VideoGenerationResponse>(newJob("video", payload, sceneId));
+  }
+
+  function finalFromSceneResponse(response: VideoGenerationResponse): FinalVideo {
     return {
       url: absoluteApiUrl(response.video_url),
       downloadUrl: absoluteApiUrl(response.download_url),
       filename: response.filename,
-      qualityNote: response.quality_note,
+      qualityNote: [response.quality_note, ...(response.warnings || [])].filter(Boolean).join(" "),
       label: `${response.provider} · ${response.chunk_count} LTX chunk${response.chunk_count === 1 ? "" : "s"} · ${response.render_seconds.toFixed(1)}s render${response.detail_refined ? " · Real Skin refined" : ""}`,
       hasAudio: response.media_info.has_audio,
       audioCodec: response.media_info.audio_codec,
@@ -1215,13 +1510,47 @@ export default function Home() {
       gpu: response.gpu,
       qcReport: {
         visual: resolveQCStatus(response.visual_qc_status, response.continuity_qc_passed, true, response.continuity_warnings),
-        audio: "not_checked", // Direct/Storyboard scenes have visual QC but no separate semantic audio inspector.
-        visualWarnings: response.continuity_warnings || [],
-        audioWarnings: [],
+        audio: resolveQCStatus(response.audio_qc_status, response.audio_qc_passed, false, response.audio_warnings || []),
+        visualWarnings: [...(response.continuity_warnings || []), ...qcReasons(response.visual_qc)],
+        audioWarnings: [...(response.audio_warnings || []), ...qcReasons(response.audio_qc)],
         visualRetries: response.continuity_regenerations || 0,
-        audioRetakes: 0,
+        audioRetakes: response.audio_retake_count || 0,
       },
     };
+  }
+
+  function factoryVideoFromResponse(response: FactoryGenerationResponse): NonNullable<FinalVideo> {
+    return {
+        url: absoluteApiUrl(response.final_video_url),
+        downloadUrl: absoluteApiUrl(response.final_download_url),
+        filename: response.final_filename,
+        qualityNote: [response.quality_note, ...(response.warnings || [])].filter(Boolean).join(" "),
+        label: `${response.scene_count} scenes · ${response.chunk_count} LTX chunks · ${response.provider} · ${response.total_render_seconds.toFixed(1)}s GPU render${response.detail_refined ? " · Real Skin refined" : ""}`,
+        hasAudio: response.has_audio,
+        audioCodec: response.has_audio ? "AAC / generated audio" : null,
+        dimensions: `${response.width ?? "?"}×${response.height ?? "?"}`,
+        estimatedCostUsd: response.estimated_cost_usd,
+        gpu: response.gpu,
+        youtubeUrl: response.youtube_url,
+        youtubePrivacy: response.youtube_privacy,
+        qcReport: factoryQCReport(response),
+        factoryResult: response,
+    };
+  }
+
+  function audioRetakeVideo(response: AudioRetakeResponse): NonNullable<FinalVideo> {
+    return { filename: response.filename, url: absoluteApiUrl(response.video_url), downloadUrl: absoluteApiUrl(response.download_url), label: "Audio correction · original picture preserved", qualityNote: "The original take remains in Saved takes. Review the corrected dialogue before sharing.", hasAudio: true, audioCodec: response.media_info.audio_codec, dimensions: `${response.media_info.width}×${response.media_info.height}`, qcReport: { visual: response.visual_qc_status || "not_checked", audio: resolveQCStatus(response.audio_qc_status, response.audio_qc_passed, true, response.audio_warnings), visualWarnings: qcReasons(response.visual_qc), audioWarnings: response.audio_warnings || [], visualRetries: 0, audioRetakes: response.audio_retake_count || 1 } };
+  }
+
+  async function handleAudioRepair() {
+    if (!finalVideo || !spokenScript.trim() || isBusy) return;
+    setError("");
+    try {
+      const response = await executeTrackedJob<AudioRetakeResponse>(newJob("audio_retake", { filename: finalVideo.filename, spoken_script: spokenScript.trim(), audio_direction: audioDirection, seed }));
+      rememberVideo(audioRetakeVideo(response), finalVideo.aspectRatio || aspectRatio);
+      await refreshBilling();
+    } catch (err) { setError(errorMessage(err, "Audio correction failed. Your original video is still available.")); }
+    finally { setProgressMessage(""); }
   }
 
   async function handleFactory(cleanPrompt: string) {
@@ -1231,8 +1560,9 @@ export default function Home() {
     setFactoryGenerating(true);
     setProgressMessage(enhancePrompt ? "Starting AI-enhanced video factory..." : "Starting direct story sequencing (no Gemini rewrite)...");
     try {
-      const started = await createFactoryGenerationJob({
+      const response = await executeTrackedJob<FactoryGenerationResponse>(newJob("factory", {
         prompt: cleanPrompt,
+        spoken_script: spokenScript,
         target_duration_seconds: factoryTargetSeconds,
         scene_duration_seconds: factorySceneSeconds,
         aspect_ratio: aspectRatio,
@@ -1259,24 +1589,9 @@ export default function Home() {
         youtube_tags: [],
         youtube_category_id: "22",
         youtube_publish_at: null,
-      });
-      const response = await waitForFactoryGenerationJob(started.job_id, (job) => setProgressMessage(`${job.message} ${job.progress}%`));
+      }));
       setFactoryResult(response);
-      setFinalVideo({
-        url: absoluteApiUrl(response.final_video_url),
-        downloadUrl: absoluteApiUrl(response.final_download_url),
-        filename: response.final_filename,
-        qualityNote: response.quality_note,
-        label: `${response.scene_count} scenes · ${response.chunk_count} LTX chunks · ${response.provider} · ${response.total_render_seconds.toFixed(1)}s GPU render${response.detail_refined ? " · Real Skin refined" : ""}`,
-        hasAudio: response.has_audio,
-        audioCodec: response.has_audio ? "AAC / generated audio" : null,
-        dimensions: `${response.width ?? "?"}×${response.height ?? "?"}`,
-        estimatedCostUsd: response.estimated_cost_usd,
-        gpu: response.gpu,
-        youtubeUrl: response.youtube_url,
-        youtubePrivacy: response.youtube_privacy,
-        qcReport: factoryQCReport(response),
-      });
+      rememberVideo(factoryVideoFromResponse(response));
       await refreshBilling();
     } finally {
       setFactoryGenerating(false);
@@ -1289,6 +1604,12 @@ export default function Home() {
     const cleanPrompt = prompt.trim();
     if (!cleanPrompt) {
       setError("Describe the video you want to create.");
+      return;
+    }
+    const unknownHandles = [...cleanPrompt.matchAll(/(?<![A-Za-z0-9_])@([A-Za-z][A-Za-z0-9_-]{0,31})/g)]
+      .map((match) => match[1]).filter((handle) => !elements.some((element) => element.handle.toLowerCase() === handle.toLowerCase()));
+    if (unknownHandles.length) {
+      setError(`Create or select saved Elements for ${[...new Set(unknownHandles)].map((handle) => `@${handle}`).join(", ")} before generating.`);
       return;
     }
     if (referencedElements.length > activeElementLimit) {
@@ -1314,6 +1635,7 @@ export default function Home() {
         setProgressMessage("Rendering your prompt with LTX 2.5...");
         const response = await generateThroughJob({
           prompt: renderPrompt,
+          spoken_script: spokenScript,
           aspect_ratio: aspectRatio,
           duration_seconds: durationSeconds,
           seed,
@@ -1332,14 +1654,14 @@ export default function Home() {
           continuity_max_retries: 0, // Display the verdict without charging for a surprise QC-triggered GPU rerender.
           element_bindings: elementBindings,
         });
-        setFinalVideo(finalFromSceneResponse(response));
+        rememberVideo(finalFromSceneResponse(response)!);
         await refreshBilling();
         return;
       }
 
       setPlanning(true);
       setProgressMessage("Creating continuity-locked storyboard shots with audio direction...");
-      const response = await generateScenePlan({ prompt: renderPrompt, aspect_ratio: aspectRatio, scene_count: sceneCount });
+      const response = await generateScenePlan({ prompt: renderPrompt, spoken_script: spokenScript, aspect_ratio: aspectRatio, scene_count: sceneCount });
       setResult(response);
       setScenePrompts(response.scenes.reduce((current, scene) => {
         current[scene.id] = scene.prompt;
@@ -1354,13 +1676,19 @@ export default function Home() {
     }
   }
 
+  function sceneRenderSignature(sceneId: number): string {
+    const scene = result?.scenes.find((item) => item.id === sceneId);
+    return JSON.stringify({ prompt: promptWithDirectorControls(scenePrompts[sceneId] || ""), spokenScript: scene?.spoken_script || "", aspectRatio: result?.aspect_ratio, durationSeconds, seed, decoder, quality, realismProfile, audioDirection, continuityMode, elementBindings });
+  }
+
   async function renderScene(sceneId: number, referenceFrameFilename: string | null = null): Promise<RenderedSceneVideo> {
     if (!result) throw new Error("Storyboard is not available.");
     const scenePrompt = scenePrompts[sceneId]?.trim();
     if (!scenePrompt) throw new Error("This scene needs a prompt before rendering.");
     const sceneIndex = result.scenes.findIndex((scene) => scene.id === sceneId);
     const response = await generateThroughJob({
-      prompt: scenePrompt,
+      prompt: promptWithDirectorControls(scenePrompt),
+      spoken_script: result.scenes[sceneIndex]?.spoken_script || (result.scenes.length === 1 ? spokenScript : ""),
       aspect_ratio: result.aspect_ratio,
       duration_seconds: durationSeconds,
       seed,
@@ -1385,7 +1713,11 @@ export default function Home() {
       reference_frame_filename: continuityMode === "strict" ? referenceFrameFilename : null,
       continuity_strength: 1.0,
       element_bindings: elementBindings,
-    });
+    }, sceneId);
+    return { ...sceneVideoFromResponse(response), renderSignature: sceneRenderSignature(sceneId) };
+  }
+
+  function sceneVideoFromResponse(response: VideoGenerationResponse): RenderedSceneVideo {
     return {
       url: absoluteApiUrl(response.video_url),
       downloadUrl: absoluteApiUrl(response.download_url),
@@ -1397,7 +1729,7 @@ export default function Home() {
       gpu: response.gpu,
       mediaInfo: response.media_info,
       estimatedCostUsd: response.estimated_cost_usd,
-      qualityNote: response.quality_note,
+      qualityNote: [response.quality_note, ...(response.warnings || [])].filter(Boolean).join(" "),
       realismProfile: response.realism_profile,
       detailRefined: response.detail_refined,
       audioMode: response.audio_mode,
@@ -1409,6 +1741,8 @@ export default function Home() {
       continuityFrameFilename: response.continuity_frame_filename,
       continuityQcPassed: response.continuity_qc_passed,
       visualQcStatus: response.visual_qc_status,
+      audioQcStatus: response.audio_qc_status || "not_checked",
+      audioWarnings: response.audio_warnings || [],
       continuityRegenerations: response.continuity_regenerations,
       continuityWarnings: response.continuity_warnings,
       elementsUsed: response.elements_used,
@@ -1416,11 +1750,15 @@ export default function Home() {
     };
   }
 
-  async function ensureScenesThrough(targetSceneId?: number): Promise<RenderedVideoMap> {
+  async function ensureScenesThrough(targetSceneId?: number, regenerate = false): Promise<RenderedVideoMap> {
     if (!result) throw new Error("Storyboard is not available.");
-    const next: RenderedVideoMap = { ...renderedVideos };
+    const next: RenderedVideoMap = regenerate && targetSceneId != null ? invalidateSceneChain(renderedVideos, result.scenes.map((scene) => scene.id), targetSceneId) : { ...renderedVideos };
+    if (regenerate) setRenderedVideos({ ...next });
     let previousFrame: string | null = null;
+    let staleChain = false;
     for (const scene of result.scenes) {
+      if (next[scene.id]?.renderSignature !== sceneRenderSignature(scene.id)) staleChain = true;
+      if (staleChain) delete next[scene.id];
       if (next[scene.id]) {
         previousFrame = next[scene.id].continuityFrameFilename;
       } else {
@@ -1428,6 +1766,8 @@ export default function Home() {
         setProgressMessage(`Rendering scene ${scene.id}/${result.scenes.length}...`);
         const rendered = await renderScene(scene.id, previousFrame);
         next[scene.id] = rendered;
+        const take: NonNullable<FinalVideo> = { url: rendered.url, downloadUrl: rendered.downloadUrl, filename: rendered.filename, qualityNote: rendered.qualityNote, label: `Scene ${scene.id} · ${rendered.details}`, hasAudio: rendered.mediaInfo.has_audio, audioCodec: rendered.mediaInfo.audio_codec, dimensions: `${rendered.mediaInfo.width}×${rendered.mediaInfo.height}`, aspectRatio: result.aspect_ratio, createdAt: Date.now(), qcReport: { visual: resolveQCStatus(rendered.visualQcStatus, rendered.continuityQcPassed, true, rendered.continuityWarnings), audio: rendered.audioQcStatus || "not_checked", visualWarnings: rendered.continuityWarnings || [], audioWarnings: rendered.audioWarnings || [], visualRetries: rendered.continuityRegenerations, audioRetakes: 0 } };
+        setVideoTakes((current) => [take, ...current.filter((item) => item.filename !== take.filename)]);
         setRenderedVideos({ ...next });
         previousFrame = rendered.continuityFrameFilename;
       }
@@ -1439,7 +1779,7 @@ export default function Home() {
   async function handleRenderScene(sceneId: number) {
     setError("");
     try {
-      await ensureScenesThrough(sceneId);
+      await ensureScenesThrough(sceneId, Boolean(renderedVideos[sceneId]));
       await refreshBilling();
     } catch (err) {
       setError(errorMessage(err, "Scene render failed."));
@@ -1457,13 +1797,13 @@ export default function Home() {
       const completed = await ensureScenesThrough();
       setGeneratingScene(null);
       setProgressMessage("Composing scenes, delivery quality and final audio master...");
-      const combined = await combineSceneVideos({
+      const combined = await executeTrackedJob<CombineScenesResponse>(newJob("combine", {
         scene_video_urls: result.scenes.map((scene) => completed[scene.id].url),
         aspect_ratio: result.aspect_ratio,
         quality,
         audio_mode: audioMode,
-      });
-      setFinalVideo({
+      }));
+      rememberVideo({
         url: absoluteApiUrl(combined.final_video_url),
         downloadUrl: absoluteApiUrl(combined.final_download_url),
         filename: combined.final_filename,
@@ -1473,15 +1813,15 @@ export default function Home() {
         audioCodec: combined.media_info.audio_codec,
         dimensions: `${combined.media_info.width ?? "?"}×${combined.media_info.height ?? "?"}`,
         qcReport: {
-          visual: aggregateQCStatus(result.scenes.map((scene) => {
+          visual: combined.visual_qc_status || aggregateQCStatus(result.scenes.map((scene) => {
             const rendered = completed[scene.id];
             return resolveQCStatus(rendered.visualQcStatus, rendered.continuityQcPassed, rendered.continuityMode !== "off", rendered.continuityWarnings);
           })),
-          audio: "not_checked", // Combining existing clips does not re-run audio QC.
+          audio: combined.audio_qc_status || aggregateQCStatus(Object.values(completed).map((video) => video.audioQcStatus || "not_checked")),
           visualWarnings: result.scenes.flatMap((scene) =>
             (completed[scene.id].continuityWarnings || []).map((warning) => `Scene ${scene.id}: ${warning}`)
           ),
-          audioWarnings: [],
+          audioWarnings: result.scenes.flatMap((scene) => (completed[scene.id].audioWarnings || []).map((warning) => `Scene ${scene.id}: ${warning}`)),
           visualRetries: result.scenes.reduce((total, scene) => total + (completed[scene.id].continuityRegenerations || 0), 0),
           audioRetakes: 0,
         },
@@ -1498,7 +1838,7 @@ export default function Home() {
 
   function updateScenePrompt(sceneId: number, value: string) {
     setScenePrompts((current) => ({ ...current, [sceneId]: value }));
-    invalidateRenderedMedia();
+    setRenderedVideos((current) => invalidateSceneChain(current, result?.scenes.map((scene) => scene.id) || [], sceneId));
   }
 
   async function handleCheckout(packId: string) {
@@ -1560,16 +1900,41 @@ export default function Home() {
   }
 
   async function handleLogout() {
-    if (isBusy) {
-      setNotice("Finish the current render before signing out.");
+    if (isBusy || elementBusy || integrationBusy) {
+      setNotice("Finish the current operation before signing out.");
       return;
     }
     try {
       await logoutCinema();
-    } catch {
-      // Clear the local UI even if the network response is interrupted.
+    } catch (err) {
+      setError(errorMessage(err, "Unable to sign out. Please retry when the connection returns."));
+      return;
     }
+    accountVersion.current += 1;
+    jobController.current?.abort();
+    jobController.current = null;
     setAuthUser(null);
+    setElements([]);
+    setServerJobs([]);
+    setBillingMe(null);
+    setBillingCatalog(null);
+    setYoutube(null);
+    setCapabilities(null);
+    setElementFiles([]);
+    setElementFileRoles({});
+    setElementUploadError("");
+    elementSaveRequest.current = { signature: "", id: "" };
+    elementAddRequests.current.clear();
+    setElementName("");
+    setElementHandle("");
+    setElementDescription("");
+    setShowElementCreator(false);
+    setElementSearch("");
+    setPublishToYouTube(false);
+    setYoutubeTitle("");
+    setYoutubeDescription("");
+    setHistorySaveState("saved");
+    sessionsRef.current = [];
     setChatSessions([]);
     setActiveChatId(null);
     setChatHistoryReady(false);
@@ -1624,7 +1989,7 @@ export default function Home() {
             </form>
           )}
           {loginError ? <div className="cinema-login-error">{loginError}</div> : null}
-          <div className="cinema-login-footnote">Demo access on devansh.info · account history is saved server-side.</div>
+          <div className="cinema-login-footnote">Your studio history stays connected to your account.</div>
         </section>
       </main>
     );
@@ -1644,7 +2009,7 @@ export default function Home() {
           <div className="min-w-0">
             <div className="flex items-center gap-2">
               <span className="truncate text-sm font-semibold text-[var(--text-strong)]">{activeChatTitle}</span>
-              <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" title="Saved to your account" />
+              <span className={`h-1.5 w-1.5 rounded-full ${historySaveState === "saved" ? "bg-emerald-500" : "bg-amber-500"}`} title={historySaveState === "saved" ? "Saved to your account" : historySaveState === "saving" ? "Saving…" : "Saved on this device; waiting to sync"} />
             </div>
             <div className="text-[10px] text-[var(--text-muted)]">Triven Cinema Studio</div>
           </div>
@@ -1666,7 +2031,7 @@ export default function Home() {
           </div>
           {billingCatalog?.enabled && billingMe ? <span className="studio-status-pill">{formatCredits(billingMe.balance_seconds)} credits</span> : null}
           {youtube?.connected ? <span className="studio-status-pill">YouTube connected</span> : null}
-          <div className="studio-account-pill"><span>{authUser.email}</span><button type="button" onClick={handleLogout} disabled={isBusy}>Sign out</button></div>
+          <div className="studio-account-pill"><span>{authUser.email}</span><button type="button" onClick={handleLogout} disabled={isBusy || elementBusy || integrationBusy}>Sign out</button></div>
         </div>
       </header>
 
@@ -1730,11 +2095,11 @@ export default function Home() {
             </div>
 
             <div className="studio-stage-area">
-              <div className={`studio-canvas ${aspectRatio === "9:16" ? "studio-canvas-portrait" : aspectRatio === "1:1" ? "studio-canvas-square" : "studio-canvas-landscape"}`}>
+              <div className={`studio-canvas ${(finalVideo?.aspectRatio || aspectRatio) === "9:16" ? "studio-canvas-portrait" : (finalVideo?.aspectRatio || aspectRatio) === "1:1" ? "studio-canvas-square" : "studio-canvas-landscape"}`}>
                 {studioVideoUrl ? (
-                  <video src={studioVideoUrl} controls playsInline preload="metadata" className="h-full w-full object-contain" />
+                  <video src={studioVideoUrl} controls playsInline preload="metadata" className="absolute inset-0 h-full w-full object-contain" />
                 ) : studioPreviewAsset ? (
-                  <img src={absoluteApiUrl(studioPreviewAsset.asset_url)} alt={studioPreviewElement?.name || "Element preview"} decoding="async" className="h-full w-full object-contain" />
+                  <Image unoptimized width={640} height={640} src={absoluteApiUrl(studioPreviewAsset.asset_url)} alt={studioPreviewElement?.name || "Element preview"} decoding="async" className="absolute inset-0 h-full w-full object-contain" />
                 ) : (
                   <div className="studio-empty-stage">
                     <div className="studio-empty-orbit"><span>+</span></div>
@@ -1748,7 +2113,7 @@ export default function Home() {
 
           </div>
 
-          <form onSubmit={handleSubmit} className="studio-bottom-deck">
+          <form onSubmit={handleSubmit} className="studio-bottom-deck"><fieldset disabled={isBusy} className="min-w-0 contents">
             <section className="studio-elements-strip">
               <div className="studio-section-title-row">
                 <div>
@@ -1766,7 +2131,7 @@ export default function Home() {
                   const asset = primaryElementAsset(element);
                   return (
                     <button key={element.id} type="button" onClick={() => { setSelectedElementId(element.id); setDirectorTab("elements"); }} className="studio-element-compact studio-element-compact-active">
-                      <span className="studio-element-compact-thumb">{asset ? <img src={absoluteApiUrl(asset.asset_url)} alt={element.name} loading="lazy" decoding="async" /> : <span>{element.name.slice(0, 1)}</span>}</span>
+                      <span className="studio-element-compact-thumb">{asset ? <Image unoptimized width={640} height={640} src={absoluteApiUrl(asset.asset_url)} alt={element.name} loading="lazy" decoding="async" /> : <span>{element.name.slice(0, 1)}</span>}</span>
                       <span className="min-w-0 text-left"><span className="block max-w-[92px] truncate text-[10px] font-semibold text-[var(--text)]">{element.name}</span><span className={`block text-[9px] ${elementTone(element.type)}`}>@{element.handle}</span></span>
                     </button>
                   );
@@ -1775,7 +2140,7 @@ export default function Home() {
                   const asset = primaryElementAsset(element);
                   return (
                     <button key={element.id} type="button" onClick={() => insertElementMention(element)} className="studio-element-compact">
-                      <span className="studio-element-compact-thumb">{asset ? <img src={absoluteApiUrl(asset.asset_url)} alt={element.name} loading="lazy" decoding="async" /> : <span>{element.name.slice(0, 1)}</span>}</span>
+                      <span className="studio-element-compact-thumb">{asset ? <Image unoptimized width={640} height={640} src={absoluteApiUrl(asset.asset_url)} alt={element.name} loading="lazy" decoding="async" /> : <span>{element.name.slice(0, 1)}</span>}</span>
                       <span className="min-w-0 text-left"><span className="block max-w-[92px] truncate text-[10px] font-semibold text-[var(--text-secondary)]">{element.name}</span><span className="block text-[9px] text-[var(--text-muted)]">saved character</span></span>
                     </button>
                   );
@@ -1809,7 +2174,7 @@ export default function Home() {
                       const asset = primaryElementAsset(element);
                       return (
                         <button key={element.id} type="button" onMouseDown={(event) => { event.preventDefault(); chooseMention(element); }} className="studio-mention-option">
-                          {asset ? <img src={absoluteApiUrl(asset.asset_url)} alt="" /> : <span className="studio-mention-empty">{element.name.slice(0, 1)}</span>}
+                          {asset ? <Image unoptimized width={640} height={640} src={absoluteApiUrl(asset.asset_url)} alt="" /> : <span className="studio-mention-empty">{element.name.slice(0, 1)}</span>}
                           <span className="min-w-0 flex-1">
                             <span className="block truncate text-xs font-semibold text-[var(--text)]">@{element.handle}</span>
                             <span className="block truncate text-[10px] text-[var(--text-muted)]">{element.name} · {element.type}</span>
@@ -1827,10 +2192,10 @@ export default function Home() {
                     const asset = primaryElementAsset(element);
                     return (
                       <span key={element.id} className={`element-mention-chip ${elementTone(element.type)}`}>
-                        {asset ? <img src={absoluteApiUrl(asset.asset_url)} alt="" className="h-5 w-5 rounded-full object-cover" /> : null}
+                        {asset ? <Image unoptimized width={640} height={640} src={absoluteApiUrl(asset.asset_url)} alt="" className="h-5 w-5 rounded-full object-cover" /> : null}
                         @{element.handle}
                         <span className="element-hover-card">
-                          {asset ? <img src={absoluteApiUrl(asset.asset_url)} alt={element.name} className="h-28 w-full rounded-lg object-cover" /> : null}
+                          {asset ? <Image unoptimized width={640} height={640} src={absoluteApiUrl(asset.asset_url)} alt={element.name} className="h-28 w-full rounded-lg object-cover" /> : null}
                           <span className="mt-2 block text-xs font-semibold text-[var(--text)]">{element.name}</span>
                           <span className="mt-0.5 block text-[10px] uppercase text-[var(--text-muted)]">{element.type} · v{element.current_version} · {element.assets.length} refs</span>
                         </span>
@@ -1853,19 +2218,19 @@ export default function Home() {
                       {factoryDurationOptions.map((value) => <option key={value} value={value}>{value}s scene</option>)}
                     </select>
                   ) : (
-                    <select className="studio-toolbar-select" value={durationSeconds} onChange={(e) => setDurationSeconds(Number(e.target.value))}>
+                    <select className="studio-toolbar-select" value={durationSeconds} onChange={(e) => { setDurationSeconds(Number(e.target.value)); invalidateRenderedMedia(); }}>
                       {durationOptions.map((value) => <option key={value} value={value}>{value}s</option>)}
                     </select>
                   )}
                   <label className="studio-ai-toggle"><input type="checkbox" checked={enhancePrompt} onChange={(e) => setEnhancePrompt(e.target.checked)} /><span>AI Director</span></label>
                 </div>
 
-                <button type="submit" disabled={isBusy} className="studio-generate-button">
+                <button type="submit" disabled={isBusy || !chatHistoryReady} className="studio-generate-button">
                   {isBusy ? <Spinner /> : <PlayIcon />}
                   {factoryGenerating ? "Generating film" : directGenerating ? "Generating" : planning ? "Planning" : mode === "factory" ? "Generate" : mode === "direct" ? "Generate clip" : "Create storyboard"}
                 </button>
               </div>
-            </section>
+            </section></fieldset>
           </form>
 
           {progressMessage && <div className="studio-inline-notice studio-inline-info">{progressMessage}</div>}
@@ -1874,7 +2239,7 @@ export default function Home() {
         </section>
 
         <aside className="studio-inspector">
-          <div className="studio-inspector-scroll">
+          <fieldset disabled={isBusy || elementBusy} className="studio-inspector-scroll min-w-0">
             <section className="studio-inspector-section">
               <div className="studio-inspector-title-row">
                 <div>
@@ -1885,7 +2250,7 @@ export default function Home() {
               </div>
               <div className="studio-mode-switch">
                 {(["factory", "storyboard", "direct"] as GenerationMode[]).map((item) => (
-                  <button key={item} type="button" onClick={() => { setMode(item); resetOutput(); }} className={mode === item ? "studio-mode-active" : ""}>{item}</button>
+                  <button key={item} type="button" disabled={isBusy} onClick={() => { setMode(item); resetOutput(); }} className={mode === item ? "studio-mode-active" : ""}>{item}</button>
                 ))}
               </div>
             </section>
@@ -1926,7 +2291,7 @@ export default function Home() {
                     const active = hasElementMention(prompt, element.handle) || Boolean(elementApplyAll[element.id]);
                     return (
                       <button key={element.id} type="button" onClick={() => setSelectedElementId(element.id)} className={`studio-library-item ${selectedElement?.id === element.id ? "studio-library-item-selected" : ""}`}>
-                        <span className="studio-library-thumb">{asset ? <img src={absoluteApiUrl(asset.asset_url)} alt={element.name} /> : <span>{element.name.slice(0, 1)}</span>}</span>
+                        <span className="studio-library-thumb">{asset ? <Image unoptimized width={640} height={640} src={absoluteApiUrl(asset.asset_url)} alt={element.name} /> : <span>{element.name.slice(0, 1)}</span>}</span>
                         <span className="min-w-0 flex-1 text-left">
                           <span className="block truncate text-xs font-semibold text-[var(--text)]">{element.name}</span>
                           <span className="mt-0.5 block truncate text-[10px] text-[var(--text-muted)]">@{element.handle} · {element.type} · v{element.current_version}</span>
@@ -1940,7 +2305,7 @@ export default function Home() {
                 {selectedElement && (
                   <div className="studio-selected-element">
                     <div className="flex items-center gap-3">
-                      {primaryElementAsset(selectedElement) ? <img src={absoluteApiUrl(primaryElementAsset(selectedElement)!.asset_url)} alt={selectedElement.name} className="h-14 w-14 rounded-xl object-cover" /> : <div className="h-14 w-14 rounded-xl bg-[var(--empty-bg)]" />}
+                      {primaryElementAsset(selectedElement) ? <Image unoptimized width={640} height={640} src={absoluteApiUrl(primaryElementAsset(selectedElement)!.asset_url)} alt={selectedElement.name} className="h-14 w-14 rounded-xl object-cover" /> : <div className="h-14 w-14 rounded-xl bg-[var(--empty-bg)]" />}
                       <div className="min-w-0 flex-1">
                         <div className="truncate text-sm font-semibold text-[var(--text)]">{selectedElement.name}</div>
                         <div className={`mt-0.5 text-[10px] uppercase ${elementTone(selectedElement.type)}`}>{selectedElement.type} · @{selectedElement.handle}</div>
@@ -1957,9 +2322,9 @@ export default function Home() {
                       </label>
                       {selectedElement.type === "character" && (elementModes[selectedElement.id] || "identity") === "identity" && (
                         <label className="studio-field-label">Wardrobe source
-                          <select value={elementWardrobePolicies[selectedElement.id] || "prompt"} onChange={(e) => setElementWardrobePolicies((current) => ({ ...current, [selectedElement.id]: e.target.value as ElementWardrobePolicy }))} className="studio-inspector-control">
-                            <option value="prompt">Follow scene prompt · recommended</option>
-                            <option value="reference">Lock reference outfit</option>
+                          <select value={elementWardrobePolicies[selectedElement.id] || "reference"} onChange={(e) => setElementWardrobePolicies((current) => ({ ...current, [selectedElement.id]: e.target.value as ElementWardrobePolicy }))} className="studio-inspector-control">
+                            <option value="prompt">Follow scene prompt</option>
+                            <option value="reference">Lock reference outfit · default</option>
                           </select>
                         </label>
                       )}
@@ -1975,11 +2340,11 @@ export default function Home() {
                     <div className="mt-3 flex gap-2 overflow-x-auto pb-1">
                       {selectedElement.assets.map((reference) => (
                         <button key={reference.id} type="button" onClick={() => void handleSetPrimaryElementAsset(selectedElement, reference.id)} className={`studio-asset-thumb relative ${reference.id === selectedElement.primary_asset_id ? "studio-asset-thumb-active" : ""}`} title={`${elementRoleLabel(reference.role)} · click to set canonical reference`}>
-                          <img src={absoluteApiUrl(reference.asset_url)} alt="" />
+                          <Image unoptimized width={640} height={640} src={absoluteApiUrl(reference.asset_url)} alt="" />
                           <span className="absolute bottom-1 left-1 rounded bg-black/70 px-1 py-0.5 text-[8px] capitalize text-white">{elementRoleLabel(reference.role)}</span>
                         </button>
                       ))}
-                      <label className="studio-asset-thumb studio-asset-add" title="Add references">+<input type="file" multiple accept="image/png,image/jpeg,image/webp" className="hidden" onChange={(e) => void handleAddElementReferences(selectedElement, e.target.files)} /></label>
+                      <label className="studio-asset-thumb studio-asset-add" title="Add references">+<input type="file" multiple accept="image/png,image/jpeg,image/webp" className="hidden" onChange={(e) => { void handleAddElementReferences(selectedElement, e.target.files); e.target.value = ""; }} /></label>
                     </div>
                     <div className="mt-3 flex items-center justify-between">
                       <span className="text-[10px] text-[var(--text-muted)]">{selectedElement.assets.length}/{capabilities?.elements?.max_assets_per_element ?? 8} references</span>
@@ -2018,9 +2383,10 @@ export default function Home() {
                   ) : mode === "storyboard" ? (
                     <Control label="Storyboard scenes"><select className="studio-inspector-control" value={sceneCount} onChange={(e) => setSceneCount(Number(e.target.value))}>{[2,3,4,6,8,10,12,16,20].map((value) => <option key={value} value={value}>{value} scenes</option>)}</select></Control>
                   ) : null}
+                    <label className="studio-field-label">Spoken dialogue<textarea value={spokenScript} onChange={(e) => setSpokenScript(e.target.value)} rows={5} className="studio-inspector-textarea" placeholder="Exact words the character should say. Leave empty for no scripted dialogue." /></label>
                   <Control label="Audio"><select className="studio-inspector-control" value={audioMode} onChange={(e) => setAudioMode(e.target.value as AudioMode)}><option value="mastered">Generated + mastered</option><option value="native">Native LTX audio</option><option value="mute">Mute final video</option></select></Control>
-                  <Control label="Continuity"><select className="studio-inspector-control" value={continuityMode} onChange={(e) => setContinuityMode(e.target.value as ContinuityMode)}><option value="strict">Strict · identity + image</option><option value="balanced">Balanced · identity</option><option value="off">Off</option></select></Control>
-                  <Control label="Realism"><select className="studio-inspector-control" value={realismProfile} onChange={(e) => setRealismProfile(e.target.value as RealismProfile)}><option value="real_skin">Real Skin · recommended</option><option value="identity_max">Identity Max · use Character Element</option><option value="standard">Standard · faster</option></select></Control>
+                  <Control label="Continuity"><select className="studio-inspector-control" value={continuityMode} onChange={(e) => { setContinuityMode(e.target.value as ContinuityMode); invalidateRenderedMedia(); }}><option value="strict">Strict · identity + image</option><option value="balanced">Balanced · identity</option><option value="off">Off</option></select></Control>
+                  <Control label="Realism"><select className="studio-inspector-control" value={realismProfile} onChange={(e) => { setRealismProfile(e.target.value as RealismProfile); invalidateRenderedMedia(); }}><option value="real_skin">Real Skin · recommended</option><option value="identity_max">Identity Max · use Character Element</option><option value="standard">Standard · faster</option></select></Control>
                   <div className="studio-advanced-card text-[10px] leading-5 text-[var(--text-muted)]">
                     {realismProfile === "standard"
                       ? "Standard keeps the normal production render without the extra detail pass."
@@ -2036,8 +2402,8 @@ export default function Home() {
                 <details className="studio-inspector-details studio-inspector-advanced">
                   <summary>Advanced</summary>
                   <div className="mt-3 grid gap-3">
-                    <div className="grid grid-cols-2 gap-2"><Control label="Seed"><input className="studio-inspector-control" type="number" min={0} value={seed} onChange={(e) => setSeed(Number(e.target.value) || 0)} /></Control><Control label="Preview decoder"><select className="studio-inspector-control" disabled={quality !== "preview"} value={quality === "preview" ? decoder : "diffusion"} onChange={(e) => setDecoder(e.target.value as DecoderName)}><option value="conv">Conv · fast</option><option value="diffusion">Diffusion · detailed</option></select></Control></div>
-                    <label className="studio-field-label">Sound direction<textarea value={audioDirection} onChange={(e) => setAudioDirection(e.target.value)} rows={4} className="studio-inspector-textarea" placeholder="Ambience, dialogue, Foley, music direction..." /></label>
+                    <div className="grid grid-cols-2 gap-2"><Control label="Seed"><input className="studio-inspector-control" type="number" min={0} value={seed} onChange={(e) => { setSeed(Number(e.target.value) || 0); invalidateRenderedMedia(); }} /></Control><Control label="Preview decoder"><select className="studio-inspector-control" disabled={quality !== "preview"} value={quality === "preview" ? decoder : "diffusion"} onChange={(e) => setDecoder(e.target.value as DecoderName)}><option value="conv">Conv · fast</option><option value="diffusion">Diffusion · detailed</option></select></Control></div>
+                    <label className="studio-field-label">Sound direction<textarea value={audioDirection} onChange={(e) => setAudioDirection(e.target.value)} rows={4} className="studio-inspector-textarea" placeholder="Ambience, Foley, music, voice style..." /></label>
                     {mode === "factory" && youtube?.enabled && (
                       <div className="studio-advanced-card">
                         <label className="studio-feature-toggle">
@@ -2088,12 +2454,12 @@ export default function Home() {
                   <InfoRow label="Elements / scene" value={String(capabilities?.elements?.max_active_per_scene ?? 6)} />
                 </IntegrationCard>
                 <IntegrationCard title="Billing" subtitle={billingCatalog?.enabled ? "Stripe generation credits" : "Billing disabled"}>
-                  {billingCatalog?.enabled && billingMe ? <><div className="mb-2 text-xs text-[var(--success-text)]">Balance {formatCredits(billingMe.balance_seconds)}</div>{billingMe.stripe_customer_id && <button type="button" onClick={handleBillingPortal} className="studio-secondary-button w-full">Manage billing</button>}</> : <p className="text-[10px] leading-5 text-[var(--text-muted)]">Configure Stripe to enable customer generation credits.</p>}
+                  {billingCatalog?.enabled && billingMe ? <><div className="mb-2 text-xs text-[var(--success-text)]">Balance {formatCredits(billingMe.balance_seconds)}</div>{billingCatalog.packs.filter((pack) => pack.available).map((pack) => <button key={pack.id} type="button" disabled={integrationBusy} onClick={() => void handleCheckout(pack.id)} className="studio-secondary-button mb-2 w-full">{pack.label} · {formatCredits(pack.credit_seconds)}</button>)}{billingMe.stripe_customer_id && <button type="button" onClick={handleBillingPortal} className="studio-secondary-button w-full">Manage billing</button>}</> : <p className="text-[10px] leading-5 text-[var(--text-muted)]">Configure Stripe to enable customer generation credits.</p>}
                 </IntegrationCard>
                 {youtube?.enabled && <button type="button" disabled={integrationBusy} onClick={handleYouTubeConnection} className="studio-secondary-button w-full">{youtube.connected ? "Disconnect YouTube" : "Connect YouTube"}</button>}
               </div>
             </details>
-          </div>
+          </fieldset>
         </aside>
       </div>
 
@@ -2124,7 +2490,7 @@ export default function Home() {
                 return (
                   <article key={element.id} className={`studio-element-grid-card ${active ? "studio-element-grid-card-active" : ""}`}>
                     <button type="button" className="studio-element-grid-preview" onClick={() => { setSelectedElementId(element.id); setDirectorTab("elements"); setShowElementsLibrary(false); }}>
-                      {asset ? <img src={absoluteApiUrl(asset.asset_url)} alt={element.name} /> : <span>{element.name.slice(0, 1)}</span>}
+                      {asset ? <Image unoptimized width={640} height={640} src={absoluteApiUrl(asset.asset_url)} alt={element.name} /> : <span>{element.name.slice(0, 1)}</span>}
                       <span className={`studio-reference-badge ${elementTone(element.type)}`}>{element.type}</span>
                     </button>
                     <div className="studio-element-grid-meta">
@@ -2157,7 +2523,7 @@ export default function Home() {
                 const active = hasElementMention(prompt, element.handle) || Boolean(elementApplyAll[element.id]);
                 return (
                   <button key={element.id} type="button" disabled={!active && referencedElements.length >= activeElementLimit} onClick={() => { insertElementMention(element); setShowReferencePicker(false); }} className={`studio-picker-card ${active ? "studio-picker-card-active" : ""}`}>
-                    <span className="studio-picker-image">{asset ? <img src={absoluteApiUrl(asset.asset_url)} alt={element.name} /> : <span>{element.name.slice(0, 1)}</span>}</span>
+                    <span className="studio-picker-image">{asset ? <Image unoptimized width={640} height={640} src={absoluteApiUrl(asset.asset_url)} alt={element.name} /> : <span>{element.name.slice(0, 1)}</span>}</span>
                     <span className="min-w-0 text-left"><span className="block truncate text-xs font-semibold text-[var(--text)]">{element.name}</span><span className={`mt-0.5 block text-[10px] ${elementTone(element.type)}`}>@{element.handle} · {element.type}</span></span>
                     {active && <span className="studio-picker-check">✓</span>}
                   </button>
@@ -2170,30 +2536,42 @@ export default function Home() {
 
       {showElementCreator && (
         <div className="studio-modal-backdrop" role="dialog" aria-modal="true" aria-label="Create Element">
-          <div className="studio-modal">
+          <div className="studio-modal" ref={creatorRef}>
             <div className="studio-modal-header">
               <div><div className="studio-inspector-eyebrow">New Element</div><h2 className="mt-1 text-lg font-semibold text-[var(--text)]">Create a reusable visual identity</h2><p className="mt-1 text-xs text-[var(--text-muted)]">Characters, props and locations are saved once, then reused in prompts with @mentions.</p></div>
-              <button type="button" onClick={() => setShowElementCreator(false)} className="studio-icon-button">×</button>
+              <button type="button" disabled={elementBusy} aria-label="Close Element creator" onClick={() => setShowElementCreator(false)} className="studio-icon-button">×</button>
             </div>
-            <div className="studio-modal-body">
-              <div className="grid gap-3 sm:grid-cols-3">
-                {(["character", "prop", "location", "style"] as ElementType[]).map((type) => <button key={type} type="button" onClick={() => setElementType(type)} className={`studio-element-type-choice ${elementType === type ? "studio-element-type-choice-active" : ""}`}><span className={elementTone(type)}>{type}</span></button>)}
+            <fieldset disabled={elementBusy} className="studio-modal-body min-w-0">
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                {(["character", "prop", "location", "style"] as ElementType[]).map((type) => <button key={type} type="button" onClick={() => { setElementType(type); setElementFileRoles({}); }} className={`studio-element-type-choice ${elementType === type ? "studio-element-type-choice-active" : ""}`}><span className={elementTone(type)}>{type}</span></button>)}
               </div>
               <div className="mt-4 grid gap-3 sm:grid-cols-2">
-                <label className="studio-field-label">Name<input className="studio-inspector-control mt-1" value={elementName} onChange={(e) => { setElementName(e.target.value); if (!elementHandle) setElementHandle(e.target.value.replace(/[^A-Za-z0-9_-]/g, "")); }} placeholder="Radha" /></label>
-                <label className="studio-field-label">Prompt handle<div className="relative mt-1"><span className="absolute left-3 top-1/2 -translate-y-1/2 text-xs text-[var(--text-muted)]">@</span><input className="studio-inspector-control pl-7" value={elementHandle} onChange={(e) => setElementHandle(e.target.value.replace(/^@/, "").replace(/[^A-Za-z0-9_-]/g, ""))} placeholder="Radha" /></div></label>
+                <label className="studio-field-label">Name<input className="studio-inspector-control mt-1" maxLength={80} autoComplete="off" value={elementName} onChange={(e) => { const automaticHandle = elementName.replace(/[^A-Za-z0-9_-]/g, "").replace(/^[^A-Za-z]+/, "").slice(0, 32); if (!elementHandle || elementHandle === automaticHandle) setElementHandle(e.target.value.replace(/[^A-Za-z0-9_-]/g, "").replace(/^[^A-Za-z]+/, "").slice(0, 32)); setElementName(e.target.value); }} placeholder="Radha" /></label>
+                <label className="studio-field-label">Prompt handle<div className="studio-handle-field mt-1"><span aria-hidden="true">@</span><input className="studio-inspector-control studio-handle-input" maxLength={32} autoComplete="off" spellCheck={false} value={elementHandle} onChange={(e) => setElementHandle(e.target.value.replace(/^@/, "").replace(/[^A-Za-z0-9_-]/g, ""))} placeholder="Radha" /></div></label>
               </div>
-              <label className="mt-3 block studio-field-label">Identity / design description<textarea rows={3} value={elementDescription} onChange={(e) => setElementDescription(e.target.value)} className="studio-inspector-textarea mt-1" placeholder="Face, costume, materials, landmarks or other traits that must remain stable." /></label>
-              <label className="studio-upload-dropzone">
+              <label className="mt-3 block studio-field-label">Identity / design description<textarea rows={3} maxLength={1600} value={elementDescription} onChange={(e) => setElementDescription(e.target.value)} className="studio-inspector-textarea mt-1" placeholder="Face, costume, materials, landmarks or other traits that must remain stable." /></label>
+              <label className="studio-upload-dropzone" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); selectElementFiles(Array.from(event.dataTransfer.files)); }}>
                 <span className="studio-upload-icon">+</span>
                 <strong>Drop reference images or click to upload</strong>
                 <small>{elementType === "character" ? "Best order: 1 face close-up · 2 full body · 3 profile · 4 costume. Triven tags these automatically." : `PNG, JPEG or WEBP · up to ${capabilities?.elements?.max_assets_per_element ?? 8} references`}</small>
-                <input type="file" multiple accept="image/png,image/jpeg,image/webp" className="hidden" onChange={(e) => setElementFiles(Array.from(e.target.files || []))} />
+                <small>PNG, JPEG or WEBP · at least 128 × 128 · up to {capabilities?.elements?.max_upload_mb ?? 15} MB each · {capabilities?.elements?.max_assets_per_element ?? 8} images maximum</small>
+                <input aria-label="Upload reference images" type="file" multiple accept="image/png,image/jpeg,image/webp,.jpg,.jpeg,.png,.webp" className="sr-only" onChange={(e) => { selectElementFiles(Array.from(e.target.files || [])); e.target.value = ""; }} />
               </label>
-              {elementFiles.length > 0 && <div className="studio-upload-file-list">{elementFiles.map((file, index) => { const role = suggestedElementRoles(elementType, elementFiles.length)[index]; return <span key={`${file.name}-${file.size}`}><strong className="capitalize">{elementRoleLabel(role)}</strong> · {file.name}</span>; })}</div>}
-            </div>
+              {elementFiles.length > 0 && <div className="studio-reference-uploads">{elementFiles.map((file, index) => {
+                const key = referenceFileKey(file);
+                const role = elementFileRoles[key] || suggestedElementRoles(elementType, elementFiles.length)[index];
+                return <div key={key} className="studio-reference-upload">
+                  <ReferenceUploadPreview file={file} />
+                  <div className="min-w-0 flex-1"><p className="truncate text-xs" title={file.name}>{file.name}</p><label className="text-xs text-[var(--text-muted)]">Reference role<select value={role} onChange={(event) => setElementFileRoles((current) => ({ ...current, [key]: event.target.value as ElementAssetRole }))} className="studio-inspector-control mt-1" aria-label={`Reference role for ${file.name}`}>
+                    {(elementType === "character" ? ["face", "full_body", "profile", "costume", "support"] : [elementType === "prop" ? "object" : elementType, "support"]).map((value) => <option key={value} value={value}>{elementRoleLabel(value as ElementAssetRole)}</option>)}
+                  </select></label></div>
+                  <button type="button" className="studio-icon-button" aria-label={`Remove ${file.name}`} onClick={() => { setElementFiles((current) => current.filter((item) => item !== file)); setElementUploadError(""); }}>×</button>
+                </div>;
+              })}</div>}
+            </fieldset>
+            {elementUploadError && <p role="alert" className="studio-upload-error">{elementUploadError}</p>}
             <div className="studio-modal-footer">
-              <button type="button" onClick={() => setShowElementCreator(false)} className="studio-secondary-button">Cancel</button>
+              <button type="button" disabled={elementBusy} onClick={() => setShowElementCreator(false)} className="studio-secondary-button">Cancel</button>
               <button type="button" onClick={() => void handleCreateElement()} disabled={elementBusy} className="studio-primary-button">{elementBusy ? "Saving..." : `Save @${elementHandle || "Element"}`}</button>
             </div>
           </div>
@@ -2201,11 +2579,24 @@ export default function Home() {
       )}
 
       <div id="studio-output" className="mx-auto w-full max-w-[1500px] px-4 pb-10 pt-5 sm:px-7 lg:px-10">
+        {historySaveState === "offline" && <div role="status" className="studio-inline-notice studio-inline-info">Changes are saved on this device. Account sync will retry automatically. <button type="button" onClick={() => setHistoryRetry((current) => current + 1)} className="underline">Retry sync</button></div>}
+        {(activeJob || jobError || serverJobs.length > 0) && <section className="mt-4 rounded-2xl border border-[var(--border)] bg-[var(--panel-bg)] p-4" aria-label="Generation jobs">
+          <h2 className="text-sm font-semibold">Generation tasks</h2>
+          {activeJob && <p role="status" className="mt-2 text-xs">{progressMessage || "Reconnecting to saved render…"} You can refresh and return to this job.</p>}
+          {jobError && <p role="alert" className="mt-2 text-xs text-[var(--danger-text)]">{jobError}</p>}
+          <div className="mt-2 space-y-2">{serverJobs.filter((job) => (job.chat_id || job.payload.chat_id) === activeChatId).slice(0, 20).map((job) => <div key={job.job_id} className="flex flex-wrap items-center justify-between gap-2 border-t border-[var(--border)] py-2 text-xs"><div><strong className="capitalize">{job.job_type} · {job.status}</strong><p className="text-[var(--text-muted)]">{job.error || job.message}</p></div>{job.status !== "failed" && <button type="button" disabled={isBusy} onClick={() => recoverServerJob(job)} className="studio-secondary-button">{job.status === "completed" ? "Open result" : "Resume tracking"}</button>}</div>)}</div>
+        </section>}
+        {recoveredAssets.length > 0 && <details className="mt-4 rounded-2xl border border-[var(--border)] p-4"><summary className="cursor-pointer text-sm font-semibold">Saved render assets ({recoveredAssets.length})</summary><p className="mt-2 text-xs text-[var(--text-muted)]">These outputs remain available even if a later step fails.</p><div className="mt-3 grid gap-3 sm:grid-cols-2">{recoveredAssets.filter((asset) => asset.filename.endsWith(".mp4")).map((asset) => <div key={asset.filename} className="min-w-0 rounded-xl border border-[var(--border)] p-3"><video controls preload="metadata" src={asset.video_url || `/media/generated/${encodeURIComponent(asset.filename)}`} className="w-full" /><div className="mt-2 flex flex-wrap gap-2 text-xs"><span>Visual QC</span><QCStatusPill status={asset.visual_qc_status || asset.metadata?.visual_qc_status || "not_checked"} /><span>Audio QC</span><QCStatusPill status={asset.audio_qc_status || asset.metadata?.audio_qc_status || "not_checked"} /></div><a className="mt-2 inline-block text-xs underline" href={asset.download_url || `/api/v1/generations/download/${encodeURIComponent(asset.filename)}`}>Download retained clip</a></div>)}</div></details>}
+        {videoTakes.length > 0 && <details className="mt-4 rounded-2xl border border-[var(--border)] bg-[var(--panel-bg)] p-4"><summary className="cursor-pointer text-sm font-semibold">Saved takes ({videoTakes.length})</summary><p className="mt-2 text-xs text-[var(--text-muted)]">Every successful take is kept when you change settings or retry.</p><div className="mt-3 space-y-2">{videoTakes.map((take, index) => <div key={take.filename} className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[var(--border)] p-3"><div className="min-w-0"><p className="text-xs">Take {videoTakes.length - index} · {take.label}</p><div className="mt-1 flex flex-wrap gap-2"><span className="text-xs">Visual</span><QCStatusPill status={take.qcReport?.visual || "unknown"} /><span className="text-xs">Audio</span><QCStatusPill status={take.qcReport?.audio || "unknown"} /></div></div><div className="flex gap-2"><button type="button" disabled={isBusy} onClick={() => { setFinalVideo(take); setFactoryResult(take.factoryResult || null); }} className="studio-secondary-button">Watch & inspect</button><a href={take.downloadUrl} className="studio-secondary-button">Download</a></div></div>)}</div></details>}
+
         {finalVideo && (
           <section className="mt-5">
-            <FinalVideoCard video={finalVideo} aspectRatio={aspectRatio} />
+            <FinalVideoCard video={finalVideo} aspectRatio={finalVideo.aspectRatio || aspectRatio} />
+            <details className="mt-3 rounded-2xl border border-[var(--border)] bg-[var(--panel-bg)] p-4"><summary className="cursor-pointer text-sm font-semibold">Correct audio using the existing video</summary><p className="mt-2 text-xs text-[var(--text-muted)]">The picture and original take are preserved. {billingCatalog?.enabled && billingCatalog.enforce_credits ? "This correction uses generation credits equal to the clip duration." : "A new audio take will be generated and checked."}</p><label className="mt-3 block text-xs">Exact spoken dialogue<textarea disabled={isBusy} value={spokenScript} onChange={(event) => setSpokenScript(event.target.value)} rows={4} className="studio-inspector-textarea mt-1" /></label><button type="button" onClick={() => void handleAudioRepair()} disabled={isBusy || !spokenScript.trim()} className="studio-primary-button mt-3">Generate corrected audio</button></details>
           </section>
         )}
+
+        {!!factoryResult?.scene_results?.length && <details className="mt-5 rounded-2xl border border-[var(--border)] bg-[var(--panel-bg)] p-4"><summary className="cursor-pointer text-sm font-semibold">Inspect individual scenes ({factoryResult.scene_results.length})</summary><div className="mt-4 grid gap-4 lg:grid-cols-2">{factoryResult.scene_results.map((scene) => <article key={scene.filename} className="overflow-hidden rounded-xl border border-[var(--border)]"><video src={scene.video_url} controls preload="metadata" className="w-full" /><div className="p-3"><h3 className="text-sm font-semibold">Scene {scene.scene_index + 1}</h3><div className="mt-2 flex flex-wrap items-center gap-2 text-xs"><span>Visual / identity QC</span><QCStatusPill status={scene.visual_qc_status || "not_checked"} /><span>Speech / audio QC</span><QCStatusPill status={scene.audio_qc_status || "not_checked"} /></div>{[scene.visual_qc, scene.audio_qc].flatMap(qcReasons).map((reason, index) => <p key={index} className="mt-2 text-xs">{reason}</p>)}<a href={scene.download_url} className="mt-3 inline-block text-xs underline">Download scene</a></div></article>)}</div></details>}
 
         {factoryResult && (
           <section className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-7">
@@ -2253,15 +2644,18 @@ export default function Home() {
                         <div className="shrink-0 rounded-lg border border-[var(--border)] px-2.5 py-1 text-[10px] text-[var(--text-muted)]">{durationSeconds}s render</div>
                       </div>
                       {isEditing ? (
-                        <textarea value={scenePrompts[scene.id] || ""} onChange={(e) => updateScenePrompt(scene.id, e.target.value)} rows={8} className="mt-5 w-full resize-none rounded-xl border border-[var(--border)] bg-[var(--input-bg)] p-4 text-sm leading-6 text-[var(--text)] outline-none" />
+                        <textarea disabled={isBusy} value={scenePrompts[scene.id] || ""} onChange={(e) => updateScenePrompt(scene.id, e.target.value)} rows={8} className="mt-5 w-full resize-none rounded-xl border border-[var(--border)] bg-[var(--input-bg)] p-4 text-sm leading-6 text-[var(--text)] outline-none" />
                       ) : <p className="mt-5 line-clamp-6 text-sm leading-6 text-[var(--text-muted)]">{scenePrompts[scene.id]}</p>}
+                      <details className="mt-3 text-xs text-[var(--text-muted)]"><summary className="cursor-pointer">Scene dialogue</summary><textarea aria-label={`Spoken dialogue for scene ${scene.id}`} disabled={isBusy} value={scene.spoken_script || ""} onChange={(event) => { const value = event.target.value; setResult((current) => current ? { ...current, scenes: current.scenes.map((item) => item.id === scene.id ? { ...item, spoken_script: value } : item) } : current); setRenderedVideos((current) => invalidateSceneChain(current, result.scenes.map((item) => item.id), scene.id)); }} rows={3} className="studio-inspector-textarea mt-2" placeholder="Exact words for this scene" /></details>
                       {video && (
                         <div className="mt-4 space-y-2">
+                          {video.renderSignature !== sceneRenderSignature(scene.id) && <p className="text-xs text-amber-700">Settings changed. This saved take remains available; the next render will update this scene and its downstream references.</p>}
                           <div className="flex flex-wrap items-center gap-2 text-xs text-[var(--text)]">
                             <span className="font-medium">Scene visual QC:</span>
                             <QCStatusPill status={resolveQCStatus(video.visualQcStatus, video.continuityQcPassed, video.continuityMode !== "off", video.continuityWarnings)} />
                             {video.continuityRegenerations > 0 && <span className="text-[var(--text-muted)]">{video.continuityRegenerations} retry attempt{video.continuityRegenerations === 1 ? "" : "s"}</span>}
                           </div>
+                          <div className="flex items-center gap-2 text-xs"><span>Speech / audio QC:</span><QCStatusPill status={video.audioQcStatus || "not_checked"} /></div>
                           {video.continuityWarnings?.length > 0 && (
                             <details className="text-xs text-[var(--text-muted)]">
                               <summary className="cursor-pointer">QC details ({video.continuityWarnings.length})</summary>
@@ -2305,6 +2699,20 @@ function InfoRow({ label, value }: { label: string; value: string }) {
 
 function Stat({ label, value, detail }: { label: string; value: string; detail: string }) {
   return <div className="rounded-2xl border border-[var(--border)] bg-[var(--panel-bg)] p-4"><div className="text-[10px] uppercase tracking-[0.16em] text-[var(--text-muted)]">{label}</div><div className="mt-2 text-lg font-semibold text-[var(--text)]">{value}</div><div className="mt-1 text-[11px] text-[var(--text-muted)]">{detail}</div></div>;
+}
+
+function qcReasons(report?: Record<string, unknown>): string[] {
+  if (!report) return [];
+  const reasons: string[] = [];
+  for (const key of ["warnings", "issues", "violations", "reason", "note", "error"]) {
+    const value = report[key];
+    if (typeof value === "string" && value.trim()) reasons.push(value);
+    if (Array.isArray(value)) for (const item of value) {
+      if (typeof item === "string") reasons.push(item);
+      else if (item && typeof item === "object" && typeof item.reason === "string") reasons.push(item.reason);
+    }
+  }
+  return [...new Set(reasons)];
 }
 
 function QCStatusPill({ status }: { status: QCStatus }) {

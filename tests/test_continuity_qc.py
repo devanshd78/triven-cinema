@@ -23,7 +23,8 @@ class ContinuityQCTests(unittest.TestCase):
             qc_mode="off",
         )
         self.assertTrue(result.skipped)
-        self.assertTrue(result.passed)
+        self.assertFalse(result.passed)
+        self.assertTrue(result.not_checked)
 
     def test_reference_images_are_labeled_as_inputs_not_generated_frames(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -40,7 +41,8 @@ class ContinuityQCTests(unittest.TestCase):
                 return SimpleNamespace(payload={"candidates": [{"content": {"parts": [{"text": json.dumps({
                     "passed": True, "duplicate_detected": False, "identity_drift_detected": False,
                     "artifact_detected": False, "wardrobe_mismatch_detected": False,
-                    "confidence": 0.95,
+                    "confidence": 0.95, "note": "No visible defects.", "violations": [],
+                    "identity_violations": [], "artifact_violations": [], "wardrobe_violations": [],
                 })}]}}]})
 
             with patch.object(settings, "gemini_api_key", "dummy-key"), patch.object(settings, "continuity_vision_qc_enabled", True), patch(

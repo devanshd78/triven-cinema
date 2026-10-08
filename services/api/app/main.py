@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from app.api.routes import auth, billing, chats, elements, factory, generations, health, youtube
 from app.core.config import settings
-from app.services.auth_service import auth_user_from_request, authenticated_workspace_id, initialize_auth_store
+from app.services.auth_service import auth_user_from_request, authenticated_workspace_id, initialize_auth_store, validate_auth_configuration
 from app.services.billing_service import initialize_billing_store
 from app.services.chat_service import initialize_chat_store
 from app.services.element_service import initialize_element_store
@@ -40,6 +40,7 @@ for directory in (STORAGE_DIR, GENERATED_DIR, LOGS_DIR):
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    validate_auth_configuration()
     initialize_job_store()
     initialize_auth_store()
     initialize_chat_store()
@@ -147,8 +148,8 @@ def bootstrap_workspace(request: Request, response: Response) -> dict:
 
 
 # SECURITY: generated media is served through an ownership check rather than a
-# raw StaticFiles mount. In production, knowing a random filename is not enough;
-# the signed workspace cookie must own a completed job that references the asset.
+# raw StaticFiles mount. Assets are registered when produced, independently of
+# whether later quality checks or publishing succeed.
 @app.get("/media/generated/{filename}")
 async def generated_media(filename: str, request: Request):
     try:
@@ -156,7 +157,7 @@ async def generated_media(filename: str, request: Request):
     except Exception as exc:
         raise HTTPException(status_code=404, detail="Generated media not found.") from exc
 
-    if settings.is_production:
+    if settings.auth_enabled or settings.is_production:
         workspace_id = workspace_id_from_request(request)
         if not workspace_id or not workspace_owns_generated_file(workspace_id, path.name):
             raise HTTPException(status_code=404, detail="Generated media not found.")

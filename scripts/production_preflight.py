@@ -141,14 +141,19 @@ def main() -> int:
         warn("CORS_ORIGINS is set; same-origin Hostinger deployment normally does not need CORS")
 
     if env.get("AUTH_ENABLED", "true").lower() in {"true", "1", "yes"}:
-        if env.get("TRIVEN_SECRET_KEY"):
+        if len(env.get("TRIVEN_SECRET_KEY", "")) >= 32:
             ok("TRIVEN_SECRET_KEY configured for signed login sessions")
         else:
-            fail("TRIVEN_SECRET_KEY is required when AUTH_ENABLED=true in production")
+            fail("TRIVEN_SECRET_KEY must contain at least 32 characters for production login")
         if env.get("DEMO_AUTH_SHOW_OTP", "true").lower() in {"true", "1", "yes"}:
-            warn("DEMO_AUTH_SHOW_OTP=true exposes the OTP in the browser; keep this only for the devansh.info demo")
+            fail("DEMO_AUTH_SHOW_OTP must be false in production; configure SMTP email delivery")
+        for key in ("SMTP_HOST", "SMTP_FROM_EMAIL"):
+            if not env.get(key):
+                fail(f"{key} is required for production login")
+        if env.get("SMTP_USE_TLS", "true").lower() not in {"true", "1", "yes"} and env.get("SMTP_USE_SSL", "false").lower() not in {"true", "1", "yes"}:
+            fail("SMTP must use TLS or SSL in production")
     else:
-        warn("AUTH_ENABLED=false leaves Studio APIs without the login gate")
+        fail("AUTH_ENABLED must be true in production")
 
     if env.get("VIDEO_PROVIDER") == "modal":
         ok("VIDEO_PROVIDER=modal")
@@ -251,6 +256,11 @@ def main() -> int:
             fail(".env is tracked by git")
         else:
             ok(".env is not tracked by git")
+        tracked_state = subprocess.run(
+            ["git", "ls-files", "storage"], cwd=ROOT, capture_output=True, text=True, check=False
+        ).stdout.strip()
+        if tracked_state:
+            fail("Runtime storage is tracked by Git. Back it up and remove it from the index before deployment.")
 
     nginx_template = ROOT / "deploy" / "hostinger" / "nginx.triven-cinema.conf"
     if nginx_template.exists():

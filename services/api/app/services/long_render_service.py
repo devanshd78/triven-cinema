@@ -5,6 +5,7 @@ from typing import Callable
 
 from app.core.config import settings
 from app.services.video_combiner import combine_videos, extract_last_frame
+from app.services.job_service import register_current_generated_asset
 from inference.providers.base import VideoGenerationResult, VideoProvider
 
 
@@ -12,6 +13,13 @@ GENERATED_DIR = (Path(__file__).resolve().parents[4] / "storage" / "generated").
 GENERATED_DIR.mkdir(parents=True, exist_ok=True)
 ProgressCallback = Callable[[int, int, str], None]
 LEGACY_INGREDIENTS_MAX_SECONDS = 20.0
+
+
+def _register_render(result: VideoGenerationResult, *, part: int | None = None) -> None:
+    register_current_generated_asset(result.filename, metadata={
+        "render_state": "generated", "visual_qc_status": "not_checked", "audio_qc_status": "not_checked",
+        "continuation_part": part, "provider": result.provider,
+    })
 
 
 def split_duration(duration_seconds: float, max_chunk_seconds: float | None = None) -> list[float]:
@@ -104,7 +112,7 @@ def render_long_clip(
         if progress:
             progress(0, 1, "Rendering LTX clip" if duration_seconds <= settings.ltx_native_chunk_seconds else "Rendering native LTX temporal windows")
         try:
-            return provider.generate(
+            result = provider.generate(
                 prompt=prompt,
                 width=width,
                 height=height,
@@ -119,6 +127,8 @@ def render_long_clip(
                 element_reference_strength=element_reference_strength,
                 realism_profile=realism_profile,
             )
+            _register_render(result)
+            return result
         except RuntimeError as exc:
             # v11.1 can request a 30s identity-conditioned logical shot, while a
             # still-deployed pre-v11 Modal worker may advertise the old 20s
@@ -184,6 +194,7 @@ def render_long_clip(
             last_result = result
             path = Path(result.path)
             rendered_paths.append(path)
+            _register_render(result, part=index + 1)
             total_render += float(result.render_seconds)
             total_wall += float(result.wall_seconds or result.render_seconds)
             gpu = result.gpu or gpu
@@ -220,8 +231,10 @@ def render_long_clip(
 
         combined = GENERATED_DIR / f"ltx-long-{uuid.uuid4().hex}.mp4"
         combine_videos(rendered_paths, combined)
-        for path in rendered_paths:
-            path.unlink(missing_ok=True)
+        register_current_generated_asset(combined.name, metadata={
+            "render_state": "assembled", "visual_qc_status": "not_checked", "audio_qc_status": "not_checked",
+            "source_filenames": [path.name for path in rendered_paths],
+        })
 
         return VideoGenerationResult(
             filename=combined.name,

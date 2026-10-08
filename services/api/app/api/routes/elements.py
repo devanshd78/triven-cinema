@@ -39,14 +39,20 @@ def _parse_roles(raw: str, count: int) -> list[str]:
 
 
 def _read_uploads(files: list[UploadFile], *, roles: str = "") -> list[UploadedElementAsset]:
+    if len(files) > settings.element_max_assets_per_element:
+        raise ElementError(f"Choose at most {settings.element_max_assets_per_element} reference images.")
     parsed_roles = _parse_roles(roles, len(files))
     uploads: list[UploadedElementAsset] = []
+    max_bytes = max(1, int(settings.element_max_upload_mb)) * 1024 * 1024
     for index, file in enumerate(files):
+        data = file.file.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise ElementError(f"{file.filename or 'Reference image'}: exceeds the {settings.element_max_upload_mb} MB upload limit.")
         uploads.append(
             UploadedElementAsset(
                 original_filename=file.filename or "reference",
                 content_type=file.content_type or "application/octet-stream",
-                data=file.file.read(),
+                data=data,
                 role=parsed_roles[index],
             )
         )
@@ -75,6 +81,7 @@ def create_workspace_element(
     type: str = Form(...),
     description: str = Form(""),
     roles: str = Form(""),
+    request_id: str = Form(""),
     files: list[UploadFile] = File(...),
 ) -> ElementResponse:
     workspace_id = ensure_workspace(request, response)
@@ -87,6 +94,7 @@ def create_workspace_element(
                 element_type=type,
                 description=description,
                 uploads=_read_uploads(files, roles=roles),
+                request_id=request_id or None,
             )
         )
     except ElementError as exc:
@@ -149,12 +157,13 @@ def add_workspace_element_assets(
     request: Request,
     response: Response,
     roles: str = Form(""),
+    request_id: str = Form(""),
     files: list[UploadFile] = File(...),
 ) -> ElementResponse:
     workspace_id = ensure_workspace(request, response)
     try:
         return ElementResponse.model_validate(
-            add_element_assets(workspace_id, element_id, _read_uploads(files, roles=roles))
+            add_element_assets(workspace_id, element_id, _read_uploads(files, roles=roles), request_id=request_id or None)
         )
     except ElementError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

@@ -8,7 +8,7 @@ class RequestOtpRequest(BaseModel):
     @classmethod
     def normalize_email(cls, value: str) -> str:
         cleaned = value.strip().lower()
-        if "@" not in cleaned or cleaned.startswith("@") or cleaned.endswith("@"):
+        if cleaned.count("@") != 1 or any(ch.isspace() or ord(ch) < 32 for ch in cleaned) or cleaned.startswith("@") or cleaned.endswith("@"):
             raise ValueError("Enter a valid email address.")
         local, domain = cleaned.rsplit("@", 1)
         if not local or "." not in domain or domain.startswith(".") or domain.endswith("."):

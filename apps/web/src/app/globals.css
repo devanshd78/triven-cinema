@@ -64,6 +64,7 @@
 }
 
 html {
+  scrollbar-gutter: stable;
   background: var(--page-bg);
   transition: background-color 160ms ease;
 }
@@ -395,6 +396,7 @@ select {
 
 .studio-stage-area {
   display: grid;
+  overflow: hidden;
   min-height: 410px;
   place-items: center;
   background:
@@ -1809,4 +1811,41 @@ select {
   .cinema-login-page { padding: 18px; }
   .cinema-login-card { padding: 22px; border-radius: 20px; }
   .studio-account-pill > span { display: none; }
+}
+
+/* A real prefix column avoids utility padding being overridden by input styles. */
+.studio-handle-field { display: flex; align-items: center; min-width: 0; border: 1px solid var(--border); border-radius: 9px; background: var(--input-bg); }
+.studio-handle-field > span { flex: 0 0 auto; padding-left: .75rem; color: var(--text-muted); font-size: .8rem; }
+.studio-handle-field .studio-handle-input { flex: 1 1 auto; min-width: 0; width: 0; padding-left: .4rem; border: 0; background: transparent; }
+.studio-handle-field:focus-within { outline: 2px solid color-mix(in srgb, #6d5dfc 45%, transparent); outline-offset: 1px; }
+.studio-modal { display: flex; flex-direction: column; max-height: min(90dvh, 900px); }
+.studio-modal-header, .studio-modal-footer { flex: 0 0 auto; }
+.studio-modal-header > div { min-width: 0; }
+.studio-modal-header .studio-icon-button { flex-shrink: 0; }
+.studio-modal-body { min-height: 0; flex: 1 1 auto; max-height: none; overscroll-behavior: contain; }
+.studio-modal-body { scrollbar-gutter: stable; overflow-anchor: none; }
+.studio-modal-header, .studio-modal-footer { overflow-wrap: anywhere; }
+.studio-modal-footer .studio-primary-button { max-width: 72%; white-space: normal; overflow-wrap: anywhere; }
+.studio-reference-uploads { display: grid; gap: .5rem; margin-top: .75rem; }
+.studio-reference-upload { display: flex; align-items: center; gap: .6rem; min-width: 0; border: 1px solid var(--border); border-radius: 10px; padding: .5rem; }
+.studio-reference-upload > img { width: 56px; height: 56px; flex: 0 0 56px; object-fit: contain; border-radius: 6px; background: var(--input-bg); }
+.studio-reference-upload > button { flex-shrink: 0; }
+.studio-upload-error { flex: 0 0 auto; max-height: 7rem; overflow-y: auto; margin: 0; padding: .6rem 1rem; color: var(--danger-text); font-size: .75rem; overflow-wrap: anywhere; border-top: 1px solid var(--border); }
+.studio-upload-dropzone { padding: .75rem; }
+.studio-upload-dropzone:focus-within { outline: 2px solid #6d5dfc; outline-offset: 2px; }
+.studio-stage-header { flex-wrap: wrap; min-height: 46px; }
+.studio-stage-header > div { flex-wrap: wrap; min-width: 0; }
+.studio-canvas { min-height: 0; min-width: 0; max-width: 100%; }
+.studio-canvas-square { width: min(100%, 520px); }
+.studio-canvas-portrait { max-width: 100%; max-height: 580px; }
+.studio-empty-stage { min-width: 0; max-height: 100%; overflow: auto; padding: clamp(.6rem, 2vw, 2rem); }
+.studio-field-label { display: block; min-width: 0; }
+.studio-inspector-control, .studio-inspector-textarea { max-width: 100%; min-width: 0; }
+@media (max-width: 480px) {
+  .studio-modal-backdrop { padding: .5rem; }
+  .studio-modal { width: calc(100vw - 1rem); max-height: 94dvh; }
+  .studio-modal-header, .studio-modal-footer { padding: .75rem; gap: .5rem; }
+  .studio-modal-body { padding: .75rem; }
+  .studio-modal-header h2 { font-size: 1rem; }
+  .studio-modal-footer button { min-width: 0; white-space: normal; }
 }

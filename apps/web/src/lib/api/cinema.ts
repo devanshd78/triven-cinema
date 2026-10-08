@@ -1,4 +1,5 @@
 import type {
+  AudioRetakeRequest,
   AsyncVideoGenerationResponse,
   BillingCatalogResponse,
   BillingMeResponse,
@@ -32,7 +33,18 @@ export const API_URL = "";
 const WORKSPACE_HEADER = "X-Triven-Workspace";
 const WORKSPACE_STORAGE_KEY = "triven_workspace_token";
 let workspaceBootstrapPromise: Promise<void> | null = null;
+let workspaceBootstrapController: AbortController | null = null;
 let workspaceBootstrapped = false;
+let accountEpoch = 0;
+const chatWrites = new Map<string, Promise<unknown>>();
+
+export class ApiError extends Error {
+  constructor(message: string, public status: number) { super(message); }
+}
+
+export class GenerationJobError extends Error {
+  constructor(message: string, public job: GenerationJobResponse) { super(message); }
+}
 
 export interface AuthUser {
   id: string;
@@ -80,18 +92,27 @@ function storeWorkspaceToken(response: Response) {
 async function ensureWorkspaceBootstrap(): Promise<void> {
   if (typeof window === "undefined" || workspaceBootstrapped) return;
   if (!workspaceBootstrapPromise) {
-    workspaceBootstrapPromise = (async () => {
+    const epoch = accountEpoch;
+    const controller = new AbortController();
+    workspaceBootstrapController = controller;
+    const bootstrap = (async () => {
       const response = await fetch(`${API_URL}/api/v1/identity/bootstrap`, {
         method: "POST",
         cache: "no-store",
         credentials: "include",
+        signal: controller.signal,
       });
+      if (epoch !== accountEpoch) throw new DOMException("Account changed", "AbortError");
       if (!response.ok) throw new Error("Unable to establish workspace session.");
       storeWorkspaceToken(response);
       workspaceBootstrapped = true;
     })().finally(() => {
-      workspaceBootstrapPromise = null;
+      if (workspaceBootstrapPromise === bootstrap) {
+        workspaceBootstrapPromise = null;
+        workspaceBootstrapController = null;
+      }
     });
+    workspaceBootstrapPromise = bootstrap;
   }
   await workspaceBootstrapPromise;
 }
@@ -120,7 +141,10 @@ async function readApiError(response: Response, fallback: string): Promise<strin
 }
 
 async function apiJson<T>(path: string, init?: RequestInit, fallback = "Request failed."): Promise<T> {
+  const epoch = accountEpoch;
   await ensureWorkspaceBootstrap();
+  if (epoch !== accountEpoch) throw new DOMException("Account changed", "AbortError");
+  init?.signal?.throwIfAborted();
   const workspaceToken = readWorkspaceToken();
   const response = await fetch(`${API_URL}${path}`, {
     cache: "no-store",
@@ -132,9 +156,13 @@ async function apiJson<T>(path: string, init?: RequestInit, fallback = "Request 
       ...(init?.headers || {}),
     },
   });
+  if (epoch !== accountEpoch) throw new DOMException("Account changed", "AbortError");
   storeWorkspaceToken(response);
-  if (!response.ok) throw new Error(await readApiError(response, fallback));
-  return response.json();
+  if (!response.ok) throw new ApiError(await readApiError(response, fallback), response.status);
+  const data = await response.json();
+  if (epoch !== accountEpoch) throw new DOMException("Account changed", "AbortError");
+  init?.signal?.throwIfAborted();
+  return data;
 }
 
 
@@ -180,9 +208,16 @@ export async function verifyLoginOtp(email: string, otp: string): Promise<AuthMe
 }
 
 export async function logoutCinema(): Promise<void> {
-  await publicJson<{ ok: boolean }>("/api/v1/auth/logout", { method: "POST" }, "Unable to sign out.");
-  if (typeof window !== "undefined") window.sessionStorage.removeItem(WORKSPACE_STORAGE_KEY);
-  workspaceBootstrapped = false;
+  accountEpoch += 1;
+  workspaceBootstrapController?.abort();
+  workspaceBootstrapController = null;
+  workspaceBootstrapPromise = null;
+  try {
+    await publicJson<{ ok: boolean }>("/api/v1/auth/logout", { method: "POST" }, "Unable to sign out.");
+  } finally {
+    if (typeof window !== "undefined") window.sessionStorage.removeItem(WORKSPACE_STORAGE_KEY);
+    workspaceBootstrapped = false;
+  }
 }
 
 export async function listChatHistory(): Promise<ServerChatListResponse> {
@@ -190,7 +225,12 @@ export async function listChatHistory(): Promise<ServerChatListResponse> {
 }
 
 export async function saveChatHistoryItem(payload: ServerChatSession): Promise<ServerChatSession> {
-  return apiJson(
+  const epoch = accountEpoch;
+  const previous = chatWrites.get(payload.id);
+  const next = (async () => {
+    await previous?.catch(() => undefined);
+    if (epoch !== accountEpoch) throw new DOMException("Account changed", "AbortError");
+    return apiJson<ServerChatSession>(
     `/api/v1/chats/${encodeURIComponent(payload.id)}`,
     {
       method: "PUT",
@@ -202,10 +242,17 @@ export async function saveChatHistoryItem(payload: ServerChatSession): Promise<S
       }),
     },
     "Unable to save chat."
-  );
+    );
+  })();
+  chatWrites.set(payload.id, next);
+  try { return await next; }
+  finally { if (chatWrites.get(payload.id) === next) chatWrites.delete(payload.id); }
 }
 
 export async function deleteChatHistoryItem(chatId: string): Promise<void> {
+  const epoch = accountEpoch;
+  await chatWrites.get(chatId)?.catch(() => undefined);
+  if (epoch !== accountEpoch) throw new DOMException("Account changed", "AbortError");
   await apiJson(
     `/api/v1/chats/${encodeURIComponent(chatId)}`,
     { method: "DELETE" },
@@ -217,6 +264,19 @@ export async function listElements(includeArchived = false): Promise<ElementList
   return apiJson(`/api/v1/elements${includeArchived ? "?include_archived=true" : ""}`, undefined, "Unable to load Elements.");
 }
 
+async function uploadElement(path: string, form: FormData): Promise<CinemaElement> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 120_000);
+  try {
+    return await apiJson(path, { method: "POST", body: form, signal: controller.signal }, "Unable to save reference images.");
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error("Upload timed out. Retry with the same images to finish the save safely.");
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export async function createElement(payload: {
   name: string;
   handle: string;
@@ -224,22 +284,25 @@ export async function createElement(payload: {
   description?: string;
   files: File[];
   roles?: ElementAssetRole[];
+  requestId?: string;
 }): Promise<CinemaElement> {
   const form = new FormData();
   form.append("name", payload.name);
   form.append("handle", payload.handle);
   form.append("type", payload.type);
   form.append("description", payload.description || "");
+  if (payload.requestId) form.append("request_id", payload.requestId);
   if (payload.roles?.length) form.append("roles", JSON.stringify(payload.roles));
   payload.files.forEach((file) => form.append("files", file));
-  return apiJson("/api/v1/elements", { method: "POST", body: form }, "Unable to create Element.");
+  return uploadElement("/api/v1/elements", form);
 }
 
-export async function addElementAssets(elementId: string, files: File[], roles?: ElementAssetRole[]): Promise<CinemaElement> {
+export async function addElementAssets(elementId: string, files: File[], roles?: ElementAssetRole[], requestId?: string): Promise<CinemaElement> {
   const form = new FormData();
+  if (requestId) form.append("request_id", requestId);
   if (roles?.length) form.append("roles", JSON.stringify(roles));
   files.forEach((file) => form.append("files", file));
-  return apiJson(`/api/v1/elements/${encodeURIComponent(elementId)}/assets`, { method: "POST", body: form }, "Unable to add Element references.");
+  return uploadElement(`/api/v1/elements/${encodeURIComponent(elementId)}/assets`, form);
 }
 
 export async function updateElement(elementId: string, payload: Record<string, unknown>): Promise<CinemaElement> {
@@ -297,21 +360,52 @@ export async function createFactoryGenerationJob(payload: FactoryGenerationReque
   );
 }
 
-export async function getGenerationJob(jobId: string): Promise<GenerationJobResponse> {
-  return apiJson(`/api/v1/generations/jobs/${jobId}`, undefined, "Unable to read generation job.");
+export async function getGenerationJob(jobId: string, signal?: AbortSignal): Promise<GenerationJobResponse> {
+  const timeout = AbortSignal.timeout(25000);
+  return apiJson(`/api/v1/generations/jobs/${jobId}`, { signal: signal ? AbortSignal.any([signal, timeout]) : timeout }, "Unable to read generation job.");
+}
+
+export async function listGenerationJobs(chatId?: string): Promise<GenerationJobResponse[]> {
+  const response = await apiJson<GenerationJobResponse[] | { jobs: GenerationJobResponse[] }>(`/api/v1/generations/jobs${chatId ? `?chat_id=${encodeURIComponent(chatId)}` : ""}`);
+  return Array.isArray(response) ? response : response.jobs;
+}
+
+export async function createCombineGenerationJob(payload: CombineScenesRequest): Promise<AsyncVideoGenerationResponse> {
+  return apiJson("/api/v1/generations/jobs/combine", { method: "POST", body: JSON.stringify(payload) }, "Unable to start composition.");
+}
+
+export async function createAudioRetakeJob(payload: AudioRetakeRequest): Promise<AsyncVideoGenerationResponse> {
+  return apiJson("/api/v1/generations/jobs/audio-retake", { method: "POST", body: JSON.stringify(payload) }, "Unable to start audio correction.");
 }
 
 export async function waitForJobResult<T>(
   jobId: string,
   onProgress?: (job: GenerationJobResponse) => void,
-  pollMs = 1000
+  pollMs = 1000,
+  signal?: AbortSignal,
+  onReconnect?: (message: string) => void,
 ): Promise<T> {
+  let failures = 0;
   for (;;) {
-    const job = await getGenerationJob(jobId);
-    onProgress?.(job);
-    if (job.status === "completed" && job.result) return job.result as unknown as T;
-    if (job.status === "failed") throw new Error(job.error || "Generation job failed.");
-    await new Promise((resolve) => setTimeout(resolve, pollMs));
+    signal?.throwIfAborted();
+    try {
+      const job = await getGenerationJob(jobId, signal);
+      signal?.throwIfAborted();
+      failures = 0;
+      onProgress?.(job);
+      if (job.status === "completed" && job.result) return job.result as unknown as T;
+      if (job.status === "failed") throw new GenerationJobError(job.error || "Generation job failed.", job);
+    } catch (error) {
+      if (error instanceof GenerationJobError || (error instanceof DOMException && error.name === "AbortError")) throw error;
+      if (error instanceof ApiError && error.status >= 400 && error.status < 500 && ![408, 429].includes(error.status)) throw error;
+      failures += 1;
+      onReconnect?.("Connection interrupted. Your render continues; reconnecting…");
+    }
+    await new Promise<void>((resolve, reject) => {
+      const cancel = () => { clearTimeout(timer); reject(new DOMException("Polling stopped", "AbortError")); };
+      const timer = setTimeout(() => { signal?.removeEventListener("abort", cancel); resolve(); }, Math.min(15000, pollMs * 2 ** failures));
+      signal?.addEventListener("abort", cancel, { once: true });
+    });
   }
 }
 

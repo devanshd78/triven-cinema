@@ -4,11 +4,15 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field
 
 from app.core.config import settings
 from app.services.continuity_service import compact_text
 from app.services.gemini_service import generate_content
+
+
+class MissingAudioError(RuntimeError):
+    pass
 
 
 class AudioQCResult(BaseModel):
@@ -23,7 +27,7 @@ class AudioQCResult(BaseModel):
 
 
 def _skipped(note: str) -> AudioQCResult:
-    return AudioQCResult(passed=True, skipped=True, note=note, confidence=0.0)
+    return AudioQCResult(passed=False, skipped=True, note=note, confidence=0.0)
 
 
 def _extract_json_text(payload: dict) -> str:
@@ -63,9 +67,12 @@ def _extract_audio(video_path: Path, destination: Path) -> None:
         ],
         capture_output=True,
         text=True,
+        timeout=max(30, settings.ffmpeg_timeout_seconds),
     )
     if process.returncode != 0 or not destination.exists() or destination.stat().st_size < 1024:
         detail = (process.stderr or "audio extraction failed")[-600:].replace("\n", " ")
+        if "does not contain any stream" in detail or "matches no streams" in detail:
+            raise MissingAudioError("The generated clip contains no audio stream.")
         raise RuntimeError(detail)
 
 
@@ -74,6 +81,7 @@ def evaluate_scene_audio(
     *,
     scene_prompt: str,
     audio_direction: str | None = None,
+    spoken_script: str = "",
 ) -> AudioQCResult:
     """Reject gibberish / invented speech before final mastering.
 
@@ -90,8 +98,11 @@ def evaluate_scene_audio(
 You are Triven Cinema's strict generated-audio quality inspector.
 Listen to the attached WAV extracted from ONE generated video scene.
 
-SCENE INTENT:
-{compact_text(scene_prompt, 2200)}
+VISUAL CONTEXT (never dialogue):
+{compact_text(scene_prompt, 1000)}
+
+IMMUTABLE SPOKEN SCRIPT — every word must be present exactly once, in order:
+{spoken_script or 'No spoken dialogue was requested. Do not invent speech.'}
 
 EXTRA AUDIO DIRECTION:
 {compact_text(audio_direction or 'No extra audio direction.', 800)}
@@ -100,7 +111,7 @@ FAIL the audio if any of these are clearly present:
 - gibberish, fake-language, garbled, slurred, chopped, unintelligible, or speech-like vocal noise;
 - background people talking when the scene did not request speech;
 - chanting or singing not explicitly requested;
-- spoken words that materially differ from exact dialogue explicitly requested in the scene;
+- spoken words that differ from the IMMUTABLE SPOKEN SCRIPT, or omitted/repeated lines;
 - overlapping duplicate voices that make intended dialogue unintelligible.
 
 Do NOT fail ordinary non-speech ambience, Foley, music, flute, wind, water, birds, cloth movement, breaths, or intentional silence.
@@ -139,8 +150,18 @@ Return ONLY JSON:
                 timeout_seconds=max(settings.gemini_timeout_seconds, 30.0),
                 thinking_level="low",
             )
-            parsed = AudioQCResult.model_validate_json(_extract_json_text(response.payload))
-    except (RuntimeError, ValueError, json.JSONDecodeError, ValidationError) as exc:
+            payload = json.loads(_extract_json_text(response.payload))
+            required = {"passed", "gibberish_detected", "unintended_speech_detected",
+                        "dialogue_mismatch_detected", "violations", "note", "confidence"}
+            if not isinstance(payload, dict) or not required.issubset(payload):
+                raise ValueError("QC provider returned an incomplete verdict.")
+            parsed = AudioQCResult.model_validate(payload, strict=True)
+            if parsed.skipped or not parsed.note.strip() or parsed.confidence <= 0:
+                raise ValueError("QC provider returned an unverified verdict.")
+    except MissingAudioError as exc:
+        return AudioQCResult(passed=False, dialogue_mismatch_detected=bool(spoken_script),
+                             violations=[str(exc)], note=str(exc), confidence=1.0)
+    except Exception as exc:
         return _skipped(f"Audio QC unavailable ({str(exc)[:180]}).")
 
     if (

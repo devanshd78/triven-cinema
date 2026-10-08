@@ -1,5 +1,6 @@
 import argparse
 import subprocess
+import uuid
 from pathlib import Path
 
 
@@ -63,23 +64,33 @@ def retake_audio_only(
             "Redeploy the current Modal image with `modal deploy modal/app.py`."
         )
 
+    repaired_path = output_path.with_name(f".retake-{uuid.uuid4().hex}.mp4")
     command = build_retake_subprocess_command(
         input_path=input_path,
-        output_path=output_path,
+        output_path=repaired_path,
         prompt=prompt,
         start_time=start_time,
         end_time=end_time,
         seed=seed,
     )
-    process = subprocess.run(
-        command,
-        cwd=LTX_REPO,
-        capture_output=True,
-        text=True,
-    )
-    if process.returncode != 0:
-        details = (process.stderr or process.stdout or "unknown Retake failure")[-8000:]
-        raise RuntimeError("LTX audio Retake failed:\n" + details)
+    try:
+        process = subprocess.run(command, cwd=LTX_REPO, capture_output=True, text=True)
+        if process.returncode != 0:
+            details = (process.stderr or process.stdout or "unknown Retake failure")[-8000:]
+            raise RuntimeError("LTX audio Retake failed:\n" + details)
+        # Retake freezes video latents, but its VAE round trip changes pixels.
+        # Keep the original compressed picture; use only the repaired audio.
+        mux = subprocess.run(build_audio_retake_mux_command(input_path, repaired_path, output_path), capture_output=True, text=True)
+        if mux.returncode or not output_path.is_file() or output_path.stat().st_size == 0:
+            raise RuntimeError("Unable to mux repaired audio onto original video: " + mux.stderr[-2000:])
+    finally:
+        repaired_path.unlink(missing_ok=True)
+
+
+def build_audio_retake_mux_command(source_path: Path, repaired_path: Path, output_path: Path) -> list[str]:
+    return ["ffmpeg", "-y", "-loglevel", "error", "-i", str(source_path), "-i", str(repaired_path),
+            "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "copy",
+            "-movflags", "+faststart", str(output_path)]
 
 
 def _retake_audio_in_ltx_env(

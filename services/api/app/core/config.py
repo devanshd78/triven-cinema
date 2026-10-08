@@ -89,12 +89,11 @@ class Settings(BaseSettings):
     factory_audio_qc_enabled: bool = True
     factory_audio_retake_enabled: bool = True
     factory_audio_qc_strict_final: bool = True
-    # External QC is advisory infrastructure. A provider outage / 429 / timeout must
-    # never discard an already rendered LTX clip. Real QC failures still remain strict.
+    # Compatibility flags retained for existing .env files. Successful media is
+    # always retained, including on QC rejection, provider outage or repair failure.
     factory_qc_fail_open_on_unavailable: bool = True
-    # Deliver a reviewable file after genuine QC rejection, too. Failed QC stays
-    # visible as qc_passed=False and prevents automatic YouTube publishing.
-    # Set false to retain the legacy strict behavior (delete/reject on QC failure).
+    # Failed QC stays visible and prevents automatic publishing. Legacy false
+    # values no longer authorize deleting successful renders.
     factory_preserve_on_qc_failure: bool = True
 
     # Continuity/cardinality guard. "auto" requests use this visual QC gate when
@@ -104,14 +103,22 @@ class Settings(BaseSettings):
     continuity_qc_timeout_seconds: float = 12.0
     continuity_qc_max_frames: int = 5
 
-    # Demo account login. The current devansh.info demo intentionally returns the
-    # generated OTP to the browser so testers can sign in without an email provider.
-    # Set DEMO_AUTH_SHOW_OTP=false before treating this as production authentication.
+    # Demo codes are available only in development. Production requires SMTP.
     auth_enabled: bool = True
     demo_auth_show_otp: bool = True
     auth_otp_ttl_seconds: int = 600
     auth_otp_max_attempts: int = 5
     auth_session_days: int = 30
+    auth_otp_resend_seconds: int = 30
+    auth_otp_requests_per_hour: int = 20
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_from_email: str = ""
+    smtp_use_tls: bool = True
+    smtp_use_ssl: bool = False
+    smtp_timeout_seconds: float = 15.0
 
     # Account-owned Studio history. Browser localStorage is only a cache; the
     # canonical previous-chat list lives in SQLite and follows the signed-in user.

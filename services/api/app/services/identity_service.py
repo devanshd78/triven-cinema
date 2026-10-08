@@ -22,9 +22,9 @@ def _secret() -> bytes:
     value = settings.triven_secret_key.strip()
     if value:
         return value.encode("utf-8")
-    if settings.is_production and (settings.billing_enabled or settings.youtube_enabled):
+    if settings.is_production:
         raise WorkspaceIdentityError(
-            "TRIVEN_SECRET_KEY must be configured when billing or YouTube is enabled."
+            "TRIVEN_SECRET_KEY must be configured in production."
         )
     return b"triven-cinema-development-only"
 
@@ -85,6 +85,15 @@ def verify_element_asset_access(workspace_id: str, asset_id: str, token: str | N
 
 
 def workspace_id_from_request(request: Request) -> str | None:
+    # The authenticated account is authoritative. An old signed workspace cookie
+    # must never select a different user's Elements, media or billing records.
+    if settings.auth_enabled:
+        from app.services.auth_service import auth_user_from_request
+        user = auth_user_from_request(request)
+        if user:
+            return str(user["workspace_id"])
+        if settings.is_production:
+            return None
     # Production identity remains HttpOnly-cookie based. During split-origin local
     # development (for example localhost:3000 -> 127.0.0.1:8000), browsers may
     # suppress SameSite cookies. A signed header fallback keeps the same identity

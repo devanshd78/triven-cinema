@@ -78,6 +78,12 @@ def main() -> int:
                 shutil.copy2(path, target_metrics / path.name)
                 backed_up += 1
 
+    # Element metadata cannot be restored without its uploaded reference images.
+    element_assets = STORAGE / "elements" / "assets"
+    if element_assets.exists():
+        shutil.copytree(element_assets, target / "element-assets")
+        backed_up += 1
+
     # Avoid accumulating empty backup directories on a fresh server.
     if backed_up == 0:
         target.rmdir()

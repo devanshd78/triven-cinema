@@ -3,11 +3,14 @@ import hashlib
 import hmac
 import json
 import secrets
+import smtplib
 import sqlite3
+import ssl
 import time
 import uuid
 from contextlib import closing
 from datetime import datetime, timezone
+from email.message import EmailMessage
 from pathlib import Path
 from threading import Lock
 
@@ -27,6 +30,74 @@ _INITIALIZED = False
 
 class AuthError(RuntimeError):
     pass
+
+
+class AuthRateLimitError(AuthError):
+    pass
+
+
+class AuthDeliveryError(AuthError):
+    pass
+
+
+def demo_login_enabled() -> bool:
+    return settings.demo_auth_show_otp and not settings.is_production
+
+
+def validate_auth_configuration() -> None:
+    if not settings.is_production:
+        return
+    if not settings.auth_enabled:
+        raise AuthError("Production requires AUTH_ENABLED=true.")
+    if settings.demo_auth_show_otp:
+        raise AuthError("Production requires DEMO_AUTH_SHOW_OTP=false and SMTP email delivery.")
+    if len(settings.triven_secret_key.strip()) < 32:
+        raise AuthError("Production requires a TRIVEN_SECRET_KEY of at least 32 characters.")
+    if not settings.smtp_host.strip() or not settings.smtp_from_email.strip():
+        raise AuthDeliveryError("Configure SMTP_HOST and SMTP_FROM_EMAIL for production login.")
+    if not (settings.smtp_use_tls or settings.smtp_use_ssl):
+        raise AuthDeliveryError("Production SMTP requires TLS or SSL.")
+
+
+def _deliver_otp(email: str, otp: str, ttl: int) -> None:
+    if demo_login_enabled():
+        return
+    if not settings.smtp_host or not settings.smtp_from_email:
+        raise AuthDeliveryError("Login email is not configured. Contact the administrator.")
+    message = EmailMessage()
+    message["Subject"] = "Your Triven Cinema sign-in code"
+    message["From"] = settings.smtp_from_email
+    message["To"] = email
+    message.set_content(f"Your Triven Cinema sign-in code is {otp}.\n\nIt expires in {max(1, ttl // 60)} minutes. If you did not request it, ignore this email.")
+    try:
+        smtp_class = smtplib.SMTP_SSL if settings.smtp_use_ssl else smtplib.SMTP
+        kwargs = {"timeout": settings.smtp_timeout_seconds}
+        if settings.smtp_use_ssl:
+            kwargs["context"] = ssl.create_default_context()
+        with smtp_class(settings.smtp_host, settings.smtp_port, **kwargs) as smtp:
+            if settings.smtp_use_tls and not settings.smtp_use_ssl:
+                smtp.starttls(context=ssl.create_default_context())
+            if settings.smtp_username:
+                smtp.login(settings.smtp_username, settings.smtp_password)
+            smtp.send_message(message)
+    except (OSError, smtplib.SMTPException) as exc:
+        raise AuthDeliveryError("The sign-in email could not be delivered. Try again later or contact the administrator.") from exc
+
+
+def limit_otp_requests(client_key: str) -> None:
+    initialize_auth_store()
+    now = int(time.time())
+    key = hmac.new(_secret(), client_key.encode(), hashlib.sha256).hexdigest()
+    with _DB_LOCK, closing(_connect()) as connection:
+        connection.execute("DELETE FROM otp_request_limits WHERE window_start < ?", (now - 3600,))
+        row = connection.execute("SELECT count FROM otp_request_limits WHERE key=?", (key,)).fetchone()
+        if row and row["count"] >= max(1, settings.auth_otp_requests_per_hour):
+            raise AuthRateLimitError("Too many sign-in requests. Please try again later.")
+        connection.execute(
+            "INSERT INTO otp_request_limits VALUES(?, ?, 1) ON CONFLICT(key) DO UPDATE SET count=count+1",
+            (key, now),
+        )
+        connection.commit()
 
 
 def _now() -> str:
@@ -82,6 +153,9 @@ def initialize_auth_store() -> None:
 
                 CREATE INDEX IF NOT EXISTS idx_users_workspace ON users(workspace_id);
                 CREATE INDEX IF NOT EXISTS idx_otp_expires ON otp_challenges(expires_at);
+                CREATE TABLE IF NOT EXISTS otp_request_limits (
+                    key TEXT PRIMARY KEY, window_start INTEGER NOT NULL, count INTEGER NOT NULL
+                );
                 """
             )
             connection.commit()
@@ -90,7 +164,7 @@ def initialize_auth_store() -> None:
 
 def normalize_email(email: str) -> str:
     cleaned = email.strip().lower()
-    if len(cleaned) > 254 or "@" not in cleaned:
+    if len(cleaned) > 254 or cleaned.count("@") != 1 or any(ch.isspace() or ord(ch) < 32 for ch in cleaned):
         raise AuthError("Enter a valid email address.")
     local, domain = cleaned.rsplit("@", 1)
     if not local or not domain or "." not in domain:
@@ -103,6 +177,7 @@ def _otp_digest(email_key: str, otp: str) -> str:
 
 
 def request_otp(email: str) -> tuple[str, str, int]:
+    validate_auth_configuration()
     initialize_auth_store()
     email_key = normalize_email(email)
     otp = f"{secrets.randbelow(1_000_000):06d}"
@@ -111,6 +186,11 @@ def request_otp(email: str) -> tuple[str, str, int]:
     expires_at = int(time.time()) + ttl
     with _DB_LOCK, closing(_connect()) as connection:
         connection.execute("DELETE FROM otp_challenges WHERE expires_at < ?", (int(time.time()),))
+        existing = connection.execute("SELECT created_at FROM otp_challenges WHERE email_key=?", (email_key,)).fetchone()
+        if existing and settings.is_production:
+            elapsed = time.time() - datetime.fromisoformat(existing["created_at"]).timestamp()
+            if elapsed < settings.auth_otp_resend_seconds:
+                raise AuthRateLimitError("Please wait before requesting another sign-in code.")
         connection.execute("DELETE FROM otp_challenges WHERE email_key = ?", (email_key,))
         connection.execute(
             """
@@ -120,6 +200,13 @@ def request_otp(email: str) -> tuple[str, str, int]:
             (challenge_id, email_key, _otp_digest(email_key, otp), expires_at, _now()),
         )
         connection.commit()
+    try:
+        _deliver_otp(email_key, otp, ttl)
+    except AuthDeliveryError:
+        with _DB_LOCK, closing(_connect()) as connection:
+            connection.execute("DELETE FROM otp_challenges WHERE id=?", (challenge_id,))
+            connection.commit()
+        raise
     return challenge_id, otp, ttl
 
 

@@ -59,6 +59,14 @@ class UploadedElementAsset:
     role: str = "support"
 
 
+@dataclass(frozen=True)
+class PreparedElementAsset:
+    upload: UploadedElementAsset
+    mime: str
+    width: int
+    height: int
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -122,6 +130,15 @@ def initialize_element_store() -> None:
             CREATE INDEX IF NOT EXISTS idx_elements_workspace ON elements(workspace_id, status, updated_at);
             CREATE INDEX IF NOT EXISTS idx_assets_element ON element_assets(element_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_versions_element ON element_versions(element_id, version DESC);
+
+            CREATE TABLE IF NOT EXISTS element_upload_requests (
+                workspace_id TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                element_id TEXT NOT NULL REFERENCES elements(id) ON DELETE CASCADE,
+                version_id TEXT NOT NULL,
+                PRIMARY KEY(workspace_id, request_id)
+            );
             """
         )
 
@@ -144,35 +161,73 @@ def _element_dir(workspace_id: str, element_id: str) -> Path:
     return path
 
 
-def _inspect_image(data: bytes, content_type: str, original_filename: str) -> tuple[str, int, int]:
+def _prepare_image(upload: UploadedElementAsset) -> PreparedElementAsset:
+    try:
+        return _decode_image(upload)
+    except ElementError as exc:
+        raise ElementError(f"{Path(upload.original_filename or 'Reference image').name}: {exc}") from exc
+
+
+def _decode_image(upload: UploadedElementAsset) -> PreparedElementAsset:
+    data = upload.data
     if not data:
         raise ElementError("Reference image is empty.")
     max_bytes = max(1, int(settings.element_max_upload_mb)) * 1024 * 1024
     if len(data) > max_bytes:
         raise ElementError(f"Reference image exceeds the {settings.element_max_upload_mb} MB upload limit.")
 
-    suffix = Path(original_filename or "").suffix.lower()
-    if content_type not in ALLOWED_IMAGE_TYPES and suffix not in ALLOWED_SUFFIXES:
-        raise ElementError("Element references must be PNG, JPEG, or WEBP images.")
-
     try:
-        with Image.open(BytesIO(data)) as image:
-            image.verify()
         with Image.open(BytesIO(data)) as image:
             width, height = image.size
             fmt = (image.format or "").upper()
+            if fmt not in {"JPEG", "PNG", "WEBP"}:
+                raise ElementError("Export this image as PNG, JPEG, or WEBP before uploading.")
+            if width < 128 or height < 128:
+                raise ElementError("Reference images must be at least 128×128 pixels.")
+            if width * height > 80_000_000:
+                raise ElementError("Reference image dimensions are too large.")
+            if getattr(image, "n_frames", 1) > 1:
+                raise ElementError("Choose a single still image, not an animated image.")
+            # Verify the complete pixels now, before recording any asset. Normalize
+            # phone orientation and color mode so previews and inference agree.
+            image.load()
+            normalized = ImageOps.exif_transpose(image)
+            normalized = normalized.convert("RGBA" if "A" in normalized.getbands() or "transparency" in normalized.info else "RGB")
+            output = BytesIO()
+            normalized.save(output, format="PNG")
+            width, height = normalized.size
+    except ElementError:
+        raise
     except Exception as exc:
-        raise ElementError("Uploaded element reference is not a valid image.") from exc
+        raise ElementError("Cannot decode this image. Export it as PNG, JPEG, or WEBP and try again.") from exc
+    return PreparedElementAsset(
+        UploadedElementAsset(upload.original_filename, "image/png", output.getvalue(), upload.role),
+        "image/png", int(width), int(height),
+    )
 
-    if width < 128 or height < 128:
-        raise ElementError("Reference images must be at least 128x128 pixels.")
-    if width * height > 80_000_000:
-        raise ElementError("Reference image dimensions are too large.")
 
-    detected = {"JPEG": "image/jpeg", "PNG": "image/png", "WEBP": "image/webp"}.get(fmt)
-    if not detected:
-        raise ElementError("Unsupported image encoding. Use PNG, JPEG, or WEBP.")
-    return detected, int(width), int(height)
+def _upload_fingerprint(operation: str, values: list, uploads: list[UploadedElementAsset]) -> str:
+    payload = [operation, values, [[item.original_filename, item.role, hashlib.sha256(item.data).hexdigest()] for item in uploads]]
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode()).hexdigest()
+
+
+def _replayed_upload(conn: sqlite3.Connection, workspace_id: str, request_id: str | None, fingerprint: str) -> dict | None:
+    if not request_id:
+        return None
+    if len(request_id) > 128:
+        raise ElementError("Invalid upload request identifier.")
+    saved = conn.execute("SELECT * FROM element_upload_requests WHERE workspace_id=? AND request_id=?", (workspace_id, request_id)).fetchone()
+    if saved is None:
+        return None
+    if saved["fingerprint"] != fingerprint:
+        raise ElementError("This upload request already saved different images. Start a new upload.")
+    row = conn.execute("SELECT * FROM elements WHERE workspace_id=? AND id=?", (workspace_id, saved["element_id"])).fetchone()
+    return _serialize_element(conn, row, saved["version_id"])
+
+
+def _record_upload(conn: sqlite3.Connection, workspace_id: str, request_id: str | None, fingerprint: str, element_id: str, version_id: str) -> None:
+    if request_id:
+        conn.execute("INSERT INTO element_upload_requests VALUES(?,?,?,?,?)", (workspace_id, request_id, fingerprint, element_id, version_id))
 
 
 def _asset_row_to_dict(row: sqlite3.Row) -> dict:
@@ -251,6 +306,8 @@ def _serialize_element(conn: sqlite3.Connection, row: sqlite3.Row, version_id: s
             "SELECT * FROM element_versions WHERE workspace_id=? AND element_id=? AND id=?",
             (row["workspace_id"], row["id"], version_id),
         ).fetchone()
+        if version is None:
+            raise ElementError("The saved Element version is unavailable. Re-select the Element before generating.")
     if version is None and row["current_version_id"]:
         version = conn.execute(
             "SELECT * FROM element_versions WHERE id=?",
@@ -268,7 +325,7 @@ def _serialize_element(conn: sqlite3.Connection, row: sqlite3.Row, version_id: s
         "handle": manifest.get("handle") or row["handle"],
         "type": manifest.get("type") or row["type"],
         "description": manifest.get("description") or "",
-        "status": manifest.get("status") or row["status"],
+        "status": row["status"],
         "current_version_id": version["id"],
         "current_version": int(version["version"]),
         "primary_asset_id": manifest.get("primary_asset_id"),
@@ -303,8 +360,9 @@ def _workspace_element_count(conn: sqlite3.Connection, workspace_id: str) -> int
     return int(row["count"] if row else 0)
 
 
-def _save_asset(conn: sqlite3.Connection, workspace_id: str, element_id: str, upload: UploadedElementAsset, *, role: str) -> str:
-    mime, width, height = _inspect_image(upload.data, upload.content_type, upload.original_filename)
+def _save_asset(conn: sqlite3.Connection, workspace_id: str, element_id: str, prepared: PreparedElementAsset, *, role: str) -> str:
+    upload = prepared.upload
+    mime, width, height = prepared.mime, prepared.width, prepared.height
     suffix = ALLOWED_IMAGE_TYPES[mime]
     asset_id = f"ea_{uuid.uuid4().hex}"
     filename = f"{asset_id}{suffix}"
@@ -312,7 +370,12 @@ def _save_asset(conn: sqlite3.Connection, workspace_id: str, element_id: str, up
     path = (directory / filename).resolve()
     if path.parent != directory:
         raise ElementError("Invalid element asset destination.")
-    path.write_bytes(upload.data)
+    temporary = path.with_suffix(".tmp")
+    try:
+        temporary.write_bytes(upload.data)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
     now = _utc_now()
     conn.execute(
         """INSERT INTO element_assets(
@@ -336,6 +399,7 @@ def create_element(
     element_type: str,
     description: str,
     uploads: Iterable[UploadedElementAsset],
+    request_id: str | None = None,
 ) -> dict:
     initialize_element_store()
     clean_name = " ".join(name.split()).strip()
@@ -350,10 +414,15 @@ def create_element(
         raise ElementError("Add at least one reference image before saving an Element.")
     if len(upload_list) > settings.element_max_assets_per_element:
         raise ElementError(f"An Element can contain at most {settings.element_max_assets_per_element} reference images.")
+    fingerprint = _upload_fingerprint("create", [clean_name, clean_handle, element_type, clean_description], upload_list)
+    prepared = [_prepare_image(upload) for upload in upload_list]
 
     element_id = f"el_{uuid.uuid4().hex}"
     now = _utc_now()
     with _DB_LOCK, closing(_connect()) as conn:
+        replay = _replayed_upload(conn, workspace_id, request_id, fingerprint)
+        if replay is not None:
+            return replay
         if _workspace_element_count(conn, workspace_id) >= settings.element_max_stored_per_workspace:
             raise ElementError(f"This workspace can store at most {settings.element_max_stored_per_workspace} active Elements.")
         try:
@@ -373,8 +442,12 @@ def create_element(
                 # references useful semantic roles automatically so the reference
                 # sheet can separate face identity from wardrobe/body guidance.
                 role = _auto_asset_role(element_type, index) if requested_role == "support" else requested_role
-                asset_ids.append(_save_asset(conn, workspace_id, element_id, upload, role=role))
-            _create_version(conn, workspace_id, element_id, primary_asset_id=asset_ids[0])
+                asset_ids.append(_save_asset(conn, workspace_id, element_id, prepared[index], role=role))
+            primary_index = next((i for i, item in enumerate(upload_list) if item.role == "primary"), None)
+            if primary_index is None and element_type == "character":
+                primary_index = next((i for i, item in enumerate(upload_list) if item.role == "face"), 0)
+            version = _create_version(conn, workspace_id, element_id, primary_asset_id=asset_ids[primary_index or 0])
+            _record_upload(conn, workspace_id, request_id, fingerprint, element_id, version["id"])
             conn.commit()
         except Exception:
             conn.rollback()
@@ -388,23 +461,40 @@ def create_element(
         return _serialize_element(conn, row)
 
 
-def add_element_assets(workspace_id: str, element_id: str, uploads: Iterable[UploadedElementAsset]) -> dict:
+def add_element_assets(workspace_id: str, element_id: str, uploads: Iterable[UploadedElementAsset], *, request_id: str | None = None) -> dict:
+    initialize_element_store()
     upload_list = list(uploads)
     if not upload_list:
         raise ElementError("Choose at least one reference image.")
+    if len(upload_list) > settings.element_max_assets_per_element:
+        raise ElementError(f"An Element can contain at most {settings.element_max_assets_per_element} reference images.")
+    fingerprint = _upload_fingerprint("add", [element_id], upload_list)
+    prepared = [_prepare_image(upload) for upload in upload_list]
     with _DB_LOCK, closing(_connect()) as conn:
+        replay = _replayed_upload(conn, workspace_id, request_id, fingerprint)
+        if replay is not None:
+            return replay
         element = conn.execute("SELECT * FROM elements WHERE workspace_id=? AND id=?", (workspace_id, element_id)).fetchone()
         if element is None:
             raise ElementError("Element not found.")
         existing = _get_assets(conn, workspace_id, element_id)
         if len(existing) + len(upload_list) > settings.element_max_assets_per_element:
             raise ElementError(f"An Element can contain at most {settings.element_max_assets_per_element} reference images.")
-        for offset, upload in enumerate(upload_list):
-            requested_role = upload.role if upload.role in VALID_ASSET_ROLES else "support"
-            role = _auto_asset_role(str(element["type"]), len(existing) + offset) if requested_role == "support" else requested_role
-            _save_asset(conn, workspace_id, element_id, upload, role=role)
-        _create_version(conn, workspace_id, element_id)
-        conn.commit()
+        directory = _element_dir(workspace_id, element_id)
+        previous_files = set(directory.iterdir())
+        try:
+            for offset, upload in enumerate(upload_list):
+                requested_role = upload.role if upload.role in VALID_ASSET_ROLES else "support"
+                role = _auto_asset_role(str(element["type"]), len(existing) + offset) if requested_role == "support" else requested_role
+                _save_asset(conn, workspace_id, element_id, prepared[offset], role=role)
+            version = _create_version(conn, workspace_id, element_id)
+            _record_upload(conn, workspace_id, request_id, fingerprint, element_id, version["id"])
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            for path in set(directory.iterdir()) - previous_files:
+                path.unlink(missing_ok=True)
+            raise
         row = conn.execute("SELECT * FROM elements WHERE id=?", (element_id,)).fetchone()
         return _serialize_element(conn, row)
 
@@ -559,9 +649,19 @@ def resolve_element_bindings(workspace_id: str, bindings: list[ElementBinding]) 
     return resolved
 
 
+def validate_prompt_bindings(prompt: str, bindings: list[ResolvedElementBinding]) -> None:
+    known = {item.handle.lower() for item in bindings}
+    missing = sorted({match.group(1) for match in MENTION_RE.finditer(prompt or "") if match.group(1).lower() not in known})
+    if missing:
+        raise ElementError("Add saved references for " + ", ".join(f"@{handle}" for handle in missing) + " before generating. These handles are not bound to this request.")
+
+
 def elements_for_scene(scene_prompt: str, bindings: list[ResolvedElementBinding]) -> list[ResolvedElementBinding]:
     mentions = {match.group(1).lower() for match in MENTION_RE.finditer(scene_prompt or "")}
-    selected = [binding for binding in bindings if binding.apply_to_all_scenes or binding.handle.lower() in mentions]
+    # A planner may replace @Flute with the saved name "Krishna Flute". Retain
+    # that explicitly bound prop instead of silently dropping its visual reference.
+    selected = [binding for binding in bindings if binding.apply_to_all_scenes or binding.handle.lower() in mentions
+                or re.search(rf"(?<!\w){re.escape(binding.name)}(?!\w)", scene_prompt or "", re.IGNORECASE)]
     start_frames = [binding for binding in selected if binding.reference_mode == "start_frame"]
     if len(start_frames) > 1:
         handles = ", ".join(f"@{item.handle}" for item in start_frames)
@@ -735,10 +835,9 @@ def _paste_element_panel(canvas: Image.Image, binding: ResolvedElementBinding, b
         return
 
     def paste(path: str, role: str, target: tuple[int, int, int, int]) -> None:
-        # In prompt-wardrobe mode every character reference is treated as an identity
-        # source, even if an older Element mislabeled a full-body upload as `face`.
-        # The upper-face crop prevents the reference outfit from overpowering text.
-        if binding.type == "character" and binding.wardrobe_policy == "prompt":
+        # Preserve a labeled close-up in full: guessing an upper-body crop can
+        # remove the chin/eyes from an already tightly framed face reference.
+        if binding.type == "character" and binding.wardrobe_policy == "prompt" and role not in {"face", "profile"}:
             _paste_face_priority_crop(canvas, path, target)
         else:
             _paste_contained(canvas, path, target)
@@ -778,7 +877,8 @@ def build_reference_sheet(bindings: list[ResolvedElementBinding], output_path: P
         if count == 1 and binding.type == "character" and binding.wardrobe_policy == "prompt":
             assets = _reference_assets_for_panel(binding)
             if assets:
-                _paste_face_priority_crop(canvas, assets[0][0], (4, 4, width - 4, height - 4))
+                paste = _paste_contained if assets[0][1] in {"face", "profile"} else _paste_face_priority_crop
+                paste(canvas, assets[0][0], (4, 4, width - 4, height - 4))
             break
         col = index % columns
         row = index // columns

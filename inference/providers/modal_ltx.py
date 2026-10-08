@@ -22,12 +22,40 @@ class ModalLTXProvider(VideoProvider):
     name = "modal-ltx-2.5"
     supports_native_long_video = True
     supports_audio_retake = True
+    _preflight_cache: dict[tuple, tuple[float, dict]] = {}
 
     def __init__(self):
         self.app_name = os.getenv("MODAL_APP_NAME", "triven-cinema-ltx")
         self.function_name = os.getenv("MODAL_FUNCTION_NAME", "generate_video")
         self.audio_retake_function_name = os.getenv("MODAL_AUDIO_RETAKE_FUNCTION_NAME", "retake_audio")
+        self.preflight_function_name = os.getenv("MODAL_PREFLIGHT_FUNCTION_NAME", "preflight")
+        self.ltx_repo_ref = os.getenv("TRIVEN_LTX_REPO_REF", "v1.4.2").strip() or "v1.4.2"
         GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+
+    def preflight(self, *, render_mode="distilled", realism_profile="standard", element_reference_required=False,
+                  operation="generate", decoder="conv", force_refresh=False) -> dict:
+        arguments = dict(render_mode=render_mode, realism_profile=realism_profile,
+                         element_reference_required=bool(element_reference_required), operation=operation, decoder=decoder)
+        key = (self.app_name, self.preflight_function_name, self.ltx_repo_ref, *arguments.values())
+        cached = self._preflight_cache.get(key)
+        if not force_refresh and cached and time.monotonic() - cached[0] < 60:
+            return cached[1]
+        try:
+            remote = modal.Function.from_name(self.app_name, self.preflight_function_name)
+            manifest = remote.remote(**arguments)
+        except Exception as exc:
+            detail = (str(exc) or type(exc).__name__).strip().replace("\n", " ")[:500]
+            raise RuntimeError("Modal inference preflight failed before GPU allocation. Verify Modal authentication and "
+                               f"deploy the current compatible worker with `modal deploy modal/app.py`. App: {self.app_name}. {detail}") from exc
+        if not isinstance(manifest, dict) or manifest.get("protocol_version") != 2:
+            raise RuntimeError("Modal worker protocol is incompatible. Deploy the current worker with `modal deploy modal/app.py` before generating.")
+        if manifest.get("ltx_repo_ref") != self.ltx_repo_ref:
+            raise RuntimeError(f"Modal worker LTX revision mismatch: expected {self.ltx_repo_ref}, "
+                               f"received {manifest.get('ltx_repo_ref') or 'unknown'}. Deploy the worker with matching TRIVEN_LTX_REPO_REF.")
+        if not manifest.get("ready"):
+            raise RuntimeError("Modal inference is not ready: " + "; ".join(str(item) for item in manifest.get("errors", ["Unknown preflight error"])))
+        self._preflight_cache[key] = (time.monotonic(), manifest)
+        return manifest
 
     @staticmethod
     def _write_video(video_bytes: bytes, prefix: str) -> Path:
@@ -71,6 +99,9 @@ class ModalLTXProvider(VideoProvider):
             if not sheet.exists():
                 raise FileNotFoundError(f"Element reference sheet not found: {sheet.name}")
             element_reference_sheet_bytes = sheet.read_bytes()
+
+        self.preflight(render_mode=render_mode, realism_profile=realism_profile,
+                       element_reference_required=bool(element_reference_sheet_bytes), decoder=decoder)
 
         try:
             remote_function = modal.Function.from_name(self.app_name, self.function_name)
@@ -140,6 +171,7 @@ class ModalLTXProvider(VideoProvider):
             raise FileNotFoundError(f"Audio Retake source video not found: {source.name}")
 
         started = time.perf_counter()
+        self.preflight(operation="retake_audio", decoder="diffusion")
         try:
             remote_function = modal.Function.from_name(self.app_name, self.audio_retake_function_name)
             result = remote_function.remote(

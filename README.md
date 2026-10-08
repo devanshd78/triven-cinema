@@ -16,7 +16,7 @@ Triven Cinema is an AI video factory: prompt input, continuity-locked storyboard
 - LTX-2.5 native temporal-window rendering for long Modal scenes with carry/blend overlap.
 - Prompt-to-finished-video Factory mode with strict scene continuity and up to 300s total runtime by default.
 - Persistent asynchronous video jobs in `storage/jobs/jobs.sqlite3`.
-- Demo email + random six-digit OTP login with signed HttpOnly account sessions.
+- Email OTP login with signed HttpOnly account sessions. Browser-visible demo codes are limited to local development; production requires SMTP.
 - Account-owned Previous Chats in `storage/chats/chats.sqlite3`, with safe one-time migration from the old browser-only history.
 - UI polling with coarse real job stages: queued -> initializing -> rendering -> delivery -> probing -> complete.
 - Per-scene source previews and regeneration.
@@ -28,6 +28,8 @@ Triven Cinema is an AI video factory: prompt input, continuity-locked storyboard
 - Stripe Checkout credit packs with idempotent webhook ledger, render charging, and failed-job refunds.
 - Per-workspace encrypted YouTube OAuth connection and resumable final-master uploads.
 - Final MP4 preview and download.
+- Durable owned media, partial-job recovery, saved takes, and refresh-safe asynchronous generation/composition.
+- Separate spoken scripts preserved through planning, per-scene visual/audio QC, and explicit audio-only repair with the original compressed picture preserved.
 - Render timing metrics and optional GPU cost estimates.
 - Seed, preview-decoder, prompt-enhancement and production realism controls in the UI.
 - Creator-grade talking-head preset with stage-2 Character IC-LoRA lock, prompt-authoritative wardrobe, early/mid/late artifact QC, user-selected final runtime, and up to 30s per 1080p creator scene.
@@ -229,13 +231,13 @@ POST /api/v1/youtube/publish
 
 ## Still not honestly "done"
 
-These are not silently claimed as complete because the recording/source does not provide enough implementation detail or they require separate external services/credentials:
+These require additional services or measured validation:
 
 - WAN inference implementation/version selection.
 - MiniMax inference implementation/version selection.
 - Native/high-fidelity 1080p LTX benchmark and optimal inference/pass settings.
 - Actual H100/H200/B200 cost comparison until the paid benchmark scripts are run.
-- Automated visual prompt-adherence scoring of rendered video (current score is text-only storyboard coverage).
+- Continuous temporal/lip-sync/voice-identity evaluation beyond sampled visual frames and semantic audio inspection.
 - ElevenLabs voice generation and voice/video synchronization.
 - Background music generation/mixing.
 - Latest-topic research -> script automation.
@@ -296,6 +298,14 @@ deploy/hostinger/README.md
 ```
 
 **Do not publish ports 3000 or 8000 on the VPS firewall.** Only SSH, HTTP and HTTPS should be publicly reachable.
+
+### Reliability update deployment
+
+The reliability update requires the new Modal worker (CPU preflight protocol 2) and production SMTP configuration. Run `modal deploy modal/app.py` separately before application rollout. `scripts/check_inference.py --all` checks enabled model recipes and authenticated weight access without allocating a GPU. The application deployment now stops on a failed backup, inference preflight, or public HTTPS health check.
+
+Runtime databases and Character uploads are no longer tracked in Git. **Before the first VPS pull of this update, follow the one-time storage migration in `deploy/hostinger/README.md`.** A pull that removes formerly tracked files can otherwise remove the server's copies. Existing database schemas and media ownership records migrate automatically at API startup; later job pruning does not revoke asset ownership.
+
+`./scripts/run_tests.sh` runs tests in an isolated temporary copy with empty runtime state. `./scripts/verify_mvp.sh` also checks syntax, frontend regression tests, lint and the production build. Tests do not establish real GPU image quality; validate speech, identity, transitions and runtime with representative renders after deploying.
 
 ## Character continuity for multi-scene stories
 
